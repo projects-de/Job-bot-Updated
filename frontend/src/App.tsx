@@ -76,6 +76,7 @@ interface AppliedJob {
 }
 
 type Tab = 'overview' | 'start';
+type AutoApplyPhase = 'idle' | 'await_cv' | 'tailoring' | 'countdown' | 'starting_bot';
 
 const App: React.FC = () => {
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -97,6 +98,40 @@ const App: React.FC = () => {
   const [expandedAppliedJobId, setExpandedAppliedJobId] = useState<string | null>(null);
   const [cvVersion, setCvVersion] = useState(0);
   const [showBlueAlert, setShowBlueAlert] = useState<string | null>(null);
+  const [autoApplyChain, setAutoApplyChain] = useState<{
+    active: boolean;
+    jobId: string | null;
+    phase: AutoApplyPhase;
+    countdown: number;
+    error?: string;
+  }>({ active: false, jobId: null, phase: 'idle', countdown: 0 });
+
+  const autoApplyTimerRef = React.useRef<number | null>(null);
+  const autoApplyStateRef = React.useRef(autoApplyChain);
+
+  useEffect(() => {
+    autoApplyStateRef.current = autoApplyChain;
+  }, [autoApplyChain]);
+
+  const clearAutoApplyTimer = () => {
+    if (autoApplyTimerRef.current) {
+      window.clearInterval(autoApplyTimerRef.current);
+      autoApplyTimerRef.current = null;
+    }
+  };
+
+  const cancelAutoApplyChain = (reason?: string) => {
+    clearAutoApplyTimer();
+    setAutoApplyChain({ active: false, jobId: null, phase: 'idle', countdown: 0, error: reason });
+    if (reason) {
+      setShowBlueAlert(reason);
+      setTimeout(() => setShowBlueAlert(null), 4000);
+    }
+  };
+
+  const hasProfile = useMemo(() => {
+    return Boolean(profile && typeof profile === 'object' && Object.keys(profile).length > 0);
+  }, [profile]);
 
   const formatPST = (isoString?: string) => {
     if (!isoString) return 'Never';
@@ -219,16 +254,90 @@ const App: React.FC = () => {
   };
 
   const handleSelectJobToApply = async (jobId: string) => {
+    // Manual mode: just select the job and take user to the Start tab.
+    // Do not clear CV automatically (Auto Apply chain depends on reusing the uploaded CV).
     setSelectedJobId(jobId);
     setTailoredPreview(null);
-    setProfile(null);
     setActiveTab('start');
     window.scrollTo({ top: 0, behavior: 'smooth' });
+    await fetchData();
+  };
+
+  const tailorSelectedJob = async (jobId: string) => {
+    setIsGeneratingPreview(true);
     try {
-      await axios.post(`${API_BASE}/cv/clear`);
+      const tailorRes = await axios.post(`${API_BASE}/jobs/tailor/${jobId}`);
+      if (tailorRes.data?.tailored) {
+        setTailoredPreview(tailorRes.data.tailored);
+        return tailorRes.data.tailored;
+      }
+      const fallback = await axios.get(`${API_BASE}/jobs/tailored/${jobId}`);
+      setTailoredPreview(fallback.data);
+      return fallback.data;
+    } finally {
+      setIsGeneratingPreview(false);
       await fetchData();
-    } catch (e) {
-      console.error('Failed to clear CV', e);
+    }
+  };
+
+  const startAutoApplyChain = async (jobId: string) => {
+    clearAutoApplyTimer();
+    setSelectedJobId(jobId);
+    setTailoredPreview(null);
+    setActiveTab('start');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+
+    setAutoApplyChain({ active: true, jobId, phase: 'await_cv', countdown: 0 });
+
+    try {
+      const profileRes = await axios.get(`${API_BASE}/cv/profile?t=${Date.now()}`);
+      const nextProfile = profileRes.data;
+      setProfile(nextProfile);
+
+      const hasCv = Boolean(nextProfile && typeof nextProfile === 'object' && Object.keys(nextProfile).length > 0);
+      if (!hasCv) {
+        setShowBlueAlert('Auto Apply: upload your CV to continue.');
+        setTimeout(() => setShowBlueAlert(null), 4500);
+        setAutoApplyChain({ active: true, jobId, phase: 'await_cv', countdown: 0 });
+        return;
+      }
+
+      setAutoApplyChain({ active: true, jobId, phase: 'tailoring', countdown: 0 });
+      await tailorSelectedJob(jobId);
+
+      // Safety window: allow cancellation before launching the bot.
+      setAutoApplyChain({ active: true, jobId, phase: 'countdown', countdown: 3 });
+      clearAutoApplyTimer();
+      autoApplyTimerRef.current = window.setInterval(() => {
+        setAutoApplyChain((prev) => {
+          if (!prev.active || prev.jobId !== jobId || prev.phase !== 'countdown') {
+            return prev;
+          }
+          const next = Math.max(0, (prev.countdown || 0) - 1);
+          return { ...prev, countdown: next };
+        });
+      }, 1000);
+
+      window.setTimeout(async () => {
+        clearAutoApplyTimer();
+        // Re-check current chain state before starting apply.
+        const current = autoApplyStateRef.current;
+        if (!current.active || current.jobId !== jobId) return;
+        if (current.phase !== 'countdown') return;
+
+        try {
+          setAutoApplyChain({ active: true, jobId, phase: 'starting_bot', countdown: 0 });
+          await axios.post(`${API_BASE}/apply/start`, [jobId]);
+          await fetchData();
+          cancelAutoApplyChain();
+        } catch (e: any) {
+          const detail = e.response?.data?.detail || e.message || 'Unknown error';
+          cancelAutoApplyChain(`Auto Apply failed to start bot: ${detail}`);
+        }
+      }, 3100);
+    } catch (e: any) {
+      const detail = e.response?.data?.detail || e.message || 'Unknown error';
+      cancelAutoApplyChain(`Auto Apply failed: ${detail}`);
     }
   };
 
@@ -276,25 +385,15 @@ const App: React.FC = () => {
     if (!selectedJobId) {
       return;
     }
-    if (!profile) {
+    if (!hasProfile) {
       alert('Please upload CV first.');
       return;
     }
-    setIsGeneratingPreview(true);
     try {
-      const tailorRes = await axios.post(`${API_BASE}/jobs/tailor/${selectedJobId}`);
-      if (tailorRes.data?.tailored) {
-        setTailoredPreview(tailorRes.data.tailored);
-      } else {
-        const fallback = await axios.get(`${API_BASE}/jobs/tailored/${selectedJobId}`);
-        setTailoredPreview(fallback.data);
-      }
-      await fetchData();
+      await tailorSelectedJob(selectedJobId);
     } catch (error) {
       console.error(error);
       alert('Failed to generate tailored CV and cover letter.');
-    } finally {
-      setIsGeneratingPreview(false);
     }
   };
 
@@ -302,7 +401,7 @@ const App: React.FC = () => {
     if (!selectedJobId) {
       return;
     }
-    if (!profile) {
+    if (!hasProfile) {
       setShowBlueAlert('Please upload CV first.');
       setTimeout(() => setShowBlueAlert(null), 4000);
       return;
@@ -360,6 +459,44 @@ const App: React.FC = () => {
       setCvVersion((v) => v + 1);
       // Also refresh all data to keep everything in sync
       await fetchData();
+
+      // If Auto Apply chain is active, continue immediately with tailoring.
+      if (autoApplyChain.active && autoApplyChain.jobId) {
+        const chainJobId = autoApplyChain.jobId;
+        setSelectedJobId(chainJobId);
+        setActiveTab('start');
+        setAutoApplyChain({ active: true, jobId: chainJobId, phase: 'tailoring', countdown: 0 });
+        try {
+          await tailorSelectedJob(chainJobId);
+          setAutoApplyChain({ active: true, jobId: chainJobId, phase: 'countdown', countdown: 3 });
+          clearAutoApplyTimer();
+          autoApplyTimerRef.current = window.setInterval(() => {
+            setAutoApplyChain((prev) => {
+              if (!prev.active || prev.jobId !== chainJobId || prev.phase !== 'countdown') return prev;
+              const next = Math.max(0, (prev.countdown || 0) - 1);
+              return { ...prev, countdown: next };
+            });
+          }, 1000);
+          window.setTimeout(async () => {
+            clearAutoApplyTimer();
+            const current = autoApplyStateRef.current;
+            if (!current.active || current.jobId !== chainJobId) return;
+            if (current.phase !== 'countdown') return;
+            try {
+              setAutoApplyChain({ active: true, jobId: chainJobId, phase: 'starting_bot', countdown: 0 });
+              await axios.post(`${API_BASE}/apply/start`, [chainJobId]);
+              await fetchData();
+              cancelAutoApplyChain();
+            } catch (err: any) {
+              const detail = err.response?.data?.detail || err.message || 'Unknown error';
+              cancelAutoApplyChain(`Auto Apply failed to start bot: ${detail}`);
+            }
+          }, 3100);
+        } catch (err: any) {
+          const detail = err.response?.data?.detail || err.message || 'Unknown error';
+          cancelAutoApplyChain(`Auto Apply tailoring failed: ${detail}`);
+        }
+      }
     } catch {
       alert('Failed to upload CV');
     } finally {
@@ -503,10 +640,10 @@ const App: React.FC = () => {
         </div>
         <button
           className="btn btn-primary btn-small"
-          onClick={() => handleSelectJobToApply(job.id)}
+          onClick={() => startAutoApplyChain(job.id)}
           disabled={appStatus.running}
         >
-          <Play size={14} /> Apply
+          <Play size={14} /> Auto Apply
         </button>
       </div>
     </motion.div>
@@ -689,7 +826,7 @@ const App: React.FC = () => {
               <div className="empty-state">
                 <Briefcase size={48} style={{ marginBottom: '1rem', opacity: 0.4 }} />
                 <h3>No Job Selected</h3>
-                <p>Go to <strong>Overview</strong> and click <strong>Apply</strong> on a job to begin.</p>
+                <p>Go to <strong>Overview</strong> and click <strong>Auto Apply</strong> on a job to begin.</p>
               </div>
             )}
 
@@ -724,6 +861,31 @@ const App: React.FC = () => {
                   </motion.div>
                 )}
 
+                {/* Auto Apply chain status */}
+                {autoApplyChain.active && autoApplyChain.jobId && String(autoApplyChain.jobId) === String(selectedJobId) && (
+                  <motion.div
+                    initial={{ opacity: 0, y: -10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="stat-card mb-4"
+                    style={{ borderLeft: '4px solid var(--primary)' }}
+                  >
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <strong>Auto Apply is running</strong>
+                        <div className="text-sm text-muted" style={{ marginTop: '0.25rem' }}>
+                          {autoApplyChain.phase === 'await_cv' && 'Step 1/3: Upload CV to continue.'}
+                          {autoApplyChain.phase === 'tailoring' && 'Step 2/3: Tailoring CV & cover letter…'}
+                          {autoApplyChain.phase === 'countdown' && `Step 3/3: Starting bot in ${autoApplyChain.countdown}s (click Cancel to stop).`}
+                          {autoApplyChain.phase === 'starting_bot' && 'Launching bot…'}
+                        </div>
+                      </div>
+                      <button className="btn btn-outline" onClick={() => cancelAutoApplyChain('Auto Apply canceled.')} disabled={autoApplyChain.phase === 'starting_bot'}>
+                        Cancel
+                      </button>
+                    </div>
+                  </motion.div>
+                )}
+
                 {/* Step 1: Upload CV */}
                 <div className="upload-section mb-4">
                   <div className="stat-card stat-card-accent text-center">
@@ -738,7 +900,7 @@ const App: React.FC = () => {
                 </div>
 
                 {/* Step 2: CV Preview + Parsed Profile */}
-                {profile && (
+                {hasProfile && (
                   <div className="parallel-view mb-4">
                     <div className="view-card">
                       <h4>Uploaded CV</h4>
@@ -756,7 +918,7 @@ const App: React.FC = () => {
                 )}
 
                 {/* Step 3: Generate tailored documents */}
-                {profile && (
+                {hasProfile && (
                   <div className="workflow-container">
                     {/* Generate button - only when no preview yet */}
                     {!tailoredPreview && !isGeneratingPreview && (

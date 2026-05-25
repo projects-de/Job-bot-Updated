@@ -407,6 +407,9 @@ def _apply_llm_answers(driver, answers: list):
             if tag == "select":
                 sel_obj = Select(el)
                 try:
+                    selected = sel_obj.first_selected_option
+                    if selected and selected.text.strip() == val:
+                        continue
                     sel_obj.select_by_visible_text(val)
                 except Exception:
                     if len(sel_obj.options) > 1:
@@ -419,7 +422,7 @@ def _apply_llm_answers(driver, answers: list):
                     driver.execute_script("arguments[0].click();", el)
             else:
                 current = (el.get_attribute("value") or "").strip()
-                if not current:
+                if current != val:
                     _safe_fill(driver, el, val)
         except Exception:
             pass
@@ -644,17 +647,16 @@ def node_fill_step(state: LinkedInState) -> dict:
     # ── 4. LLM screening question answering ───────────────────────────────────
     context = _modal_text(driver)
     all_fields = _modal_fields(driver)
-    unfilled = [
+    fields_to_fill = [
         f for f in all_fields
         if f["type"] not in ("file", "hidden", "submit", "button")
-        and not f.get("current_value", "").strip()
     ]
 
-    if unfilled:
-        llm_answers = _llm_answer_fields(cv, unfilled, context)
+    if fields_to_fill:
+        llm_answers = _llm_answer_fields(cv, fields_to_fill, context)
         if llm_answers:
             _apply_llm_answers(driver, llm_answers)
-            print(f"    [OK] LLM answered {len(llm_answers)} screening field(s)")
+            print(f"    [OK] LLM answered/verified {len(llm_answers)} field(s)")
 
     # ── 5. Fallback: radio Yes/No groups ──────────────────────────────────────
     try:

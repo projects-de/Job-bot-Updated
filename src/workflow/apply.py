@@ -147,6 +147,40 @@ def _get_latest_uploaded_resume():
     # Sort by modification time desc
     files.sort(key=os.path.getmtime, reverse=True)
     return files[0]
+def get_chrome_major_version():
+    """Retrieve the installed Google Chrome major version on Windows."""
+    try:
+        import winreg
+        # Try Current User registry
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Google\Chrome\BLBeacon")
+            version, _ = winreg.QueryValueEx(key, "version")
+            winreg.CloseKey(key)
+            if version:
+                return int(version.split('.')[0])
+        except Exception:
+            pass
+        # Try Local Machine registry (Wow6432Node)
+        try:
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Google Chrome")
+            version, _ = winreg.QueryValueEx(key, "DisplayVersion")
+            winreg.CloseKey(key)
+            if version:
+                return int(version.split('.')[0])
+        except Exception:
+            pass
+        # Try another Local Machine location
+        try:
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Google Chrome")
+            version, _ = winreg.QueryValueEx(key, "DisplayVersion")
+            winreg.CloseKey(key)
+            if version:
+                return int(version.split('.')[0])
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"Registry chrome version check failed: {e}")
+    return None
 
 
 class SequentialApplier:
@@ -162,13 +196,48 @@ class SequentialApplier:
             options.add_argument('--no-sandbox')
             options.add_argument('--disable-dev-shm-usage')
             options.add_argument('--disable-blink-features=AutomationControlled')
+            options.add_argument('--disable-popup-blocking')
+            
+            # Onboarding & first-run suppression to bypass welcome/What's New screens
+            options.add_argument('--no-first-run')
+            options.add_argument('--no-default-browser-check')
+            options.add_argument('--disable-features=ChromeWhatsNewUI')
+            options.add_argument('--disable-whats-new-ui')
+            options.add_argument('--disable-welcome-ui')
             
             # Using persistent user data directory
             user_data_dir = os.path.join(os.getcwd(), "user_data_uc")
             os.makedirs(user_data_dir, exist_ok=True)
             options.add_argument(f"--user-data-dir={user_data_dir}")
             
-            self.driver = uc.Chrome(options=options)
+            major_ver = get_chrome_major_version()
+            if major_ver:
+                print(f"Detected installed Chrome major version: {major_ver}")
+            
+            try:
+                if major_ver:
+                    print(f"Launching undetected-chromedriver with version_main={major_ver}...")
+                    self.driver = uc.Chrome(options=options, version_main=major_ver, suppress_welcome=True)
+                else:
+                    print("Could not detect Chrome version. Launching with default undetected-chromedriver...")
+                    self.driver = uc.Chrome(options=options, suppress_welcome=True)
+            except Exception as e:
+                err_msg = str(e)
+                print(f"Initial undetected-chromedriver launch failed: {err_msg}")
+                # Fallback: parse current version from the exception error string
+                import re
+                match = re.search(r"Current browser version is ([\d\.]+)", err_msg)
+                if match:
+                    version_str = match.group(1)
+                    parsed_ver = int(version_str.split('.')[0])
+                    print(f"Extracted actual Chrome major version from exception: {parsed_ver}. Retrying launch...")
+                    try:
+                        self.driver = uc.Chrome(options=options, version_main=parsed_ver, suppress_welcome=True)
+                    except Exception as retry_err:
+                        print(f"Retry launch with version_main={parsed_ver} failed: {retry_err}")
+                        raise retry_err
+                else:
+                    raise e
             
             # Deep stealth overriding
             self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
@@ -626,13 +695,13 @@ class SequentialApplier:
                     self.driver.title  # raises if browser was closed
                 except Exception:
                     print(f"Browser closed for: {job_title}")
-                    log_application(job_id, job_title, company, JobStatus.FAILED, "User closed browser")
+                    log_application(job_id, job_title, company, JobStatus.TAILORED, "User closed browser before submit")
                     return False
                 time.sleep(1)
 
             if skip_event.is_set():
                 print(f"Skipped: {job_title}")
-                log_application(job_id, job_title, company, JobStatus.FAILED, "User skipped during review")
+                log_application(job_id, job_title, company, JobStatus.TAILORED, "User skipped during review")
                 # Clean up secondary window handles and return to primary
                 try:
                     current_handle = self.driver.current_window_handle
