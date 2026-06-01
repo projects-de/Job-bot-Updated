@@ -76,7 +76,7 @@ interface AppliedJob {
 }
 
 type Tab = 'overview' | 'start';
-type AutoApplyPhase = 'idle' | 'await_cv' | 'tailoring' | 'countdown' | 'starting_bot';
+type AutoApplyPhase = 'idle' | 'await_cv' | 'await_cv_update' | 'tailoring' | 'countdown' | 'starting_bot';
 
 const App: React.FC = () => {
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -280,29 +280,9 @@ const App: React.FC = () => {
     }
   };
 
-  const startAutoApplyChain = async (jobId: string) => {
-    clearAutoApplyTimer();
-    setSelectedJobId(jobId);
-    setTailoredPreview(null);
-    setActiveTab('start');
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-
-    setAutoApplyChain({ active: true, jobId, phase: 'await_cv', countdown: 0 });
-
+  const proceedWithAutoApply = async (jobId: string) => {
+    setAutoApplyChain({ active: true, jobId, phase: 'tailoring', countdown: 0 });
     try {
-      const profileRes = await axios.get(`${API_BASE}/cv/profile?t=${Date.now()}`);
-      const nextProfile = profileRes.data;
-      setProfile(nextProfile);
-
-      const hasCv = Boolean(nextProfile && typeof nextProfile === 'object' && Object.keys(nextProfile).length > 0);
-      if (!hasCv) {
-        setShowBlueAlert('Auto Apply: upload your CV to continue.');
-        setTimeout(() => setShowBlueAlert(null), 4500);
-        setAutoApplyChain({ active: true, jobId, phase: 'await_cv', countdown: 0 });
-        return;
-      }
-
-      setAutoApplyChain({ active: true, jobId, phase: 'tailoring', countdown: 0 });
       await tailorSelectedJob(jobId);
 
       // Safety window: allow cancellation before launching the bot.
@@ -335,6 +315,52 @@ const App: React.FC = () => {
           cancelAutoApplyChain(`Auto Apply failed to start bot: ${detail}`);
         }
       }, 3100);
+    } catch (e: any) {
+      const detail = e.response?.data?.detail || e.message || 'Unknown error';
+      cancelAutoApplyChain(`Auto Apply tailoring failed: ${detail}`);
+    }
+  };
+
+  const startAutoApplyChain = async (jobId: string) => {
+    clearAutoApplyTimer();
+    setSelectedJobId(jobId);
+    setTailoredPreview(null);
+    setActiveTab('start');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+
+    setAutoApplyChain({ active: true, jobId, phase: 'await_cv', countdown: 0 });
+
+    try {
+      const profileRes = await axios.get(`${API_BASE}/cv/profile?t=${Date.now()}`);
+      const nextProfile = profileRes.data;
+      setProfile(nextProfile);
+
+      const hasCv = Boolean(nextProfile && typeof nextProfile === 'object' && Object.keys(nextProfile).length > 0);
+      if (!hasCv) {
+        setShowBlueAlert('Auto Apply: upload your CV to continue.');
+        setTimeout(() => setShowBlueAlert(null), 4500);
+        setAutoApplyChain({ active: true, jobId, phase: 'await_cv', countdown: 0 });
+        return;
+      }
+
+      setAutoApplyChain({ active: true, jobId, phase: 'await_cv_update', countdown: 15 });
+      clearAutoApplyTimer();
+      autoApplyTimerRef.current = window.setInterval(() => {
+        setAutoApplyChain((prev) => {
+          if (!prev.active || prev.jobId !== jobId || prev.phase !== 'await_cv_update') {
+            return prev;
+          }
+          const next = Math.max(0, (prev.countdown || 0) - 1);
+          return { ...prev, countdown: next };
+        });
+      }, 1000);
+
+      window.setTimeout(() => {
+        clearAutoApplyTimer();
+        const current = autoApplyStateRef.current;
+        if (!current.active || current.jobId !== jobId || current.phase !== 'await_cv_update') return;
+        proceedWithAutoApply(jobId);
+      }, 15100);
     } catch (e: any) {
       const detail = e.response?.data?.detail || e.message || 'Unknown error';
       cancelAutoApplyChain(`Auto Apply failed: ${detail}`);
@@ -462,40 +488,11 @@ const App: React.FC = () => {
 
       // If Auto Apply chain is active, continue immediately with tailoring.
       if (autoApplyChain.active && autoApplyChain.jobId) {
+        clearAutoApplyTimer();
         const chainJobId = autoApplyChain.jobId;
         setSelectedJobId(chainJobId);
         setActiveTab('start');
-        setAutoApplyChain({ active: true, jobId: chainJobId, phase: 'tailoring', countdown: 0 });
-        try {
-          await tailorSelectedJob(chainJobId);
-          setAutoApplyChain({ active: true, jobId: chainJobId, phase: 'countdown', countdown: 3 });
-          clearAutoApplyTimer();
-          autoApplyTimerRef.current = window.setInterval(() => {
-            setAutoApplyChain((prev) => {
-              if (!prev.active || prev.jobId !== chainJobId || prev.phase !== 'countdown') return prev;
-              const next = Math.max(0, (prev.countdown || 0) - 1);
-              return { ...prev, countdown: next };
-            });
-          }, 1000);
-          window.setTimeout(async () => {
-            clearAutoApplyTimer();
-            const current = autoApplyStateRef.current;
-            if (!current.active || current.jobId !== chainJobId) return;
-            if (current.phase !== 'countdown') return;
-            try {
-              setAutoApplyChain({ active: true, jobId: chainJobId, phase: 'starting_bot', countdown: 0 });
-              await axios.post(`${API_BASE}/apply/start`, [chainJobId]);
-              await fetchData();
-              cancelAutoApplyChain();
-            } catch (err: any) {
-              const detail = err.response?.data?.detail || err.message || 'Unknown error';
-              cancelAutoApplyChain(`Auto Apply failed to start bot: ${detail}`);
-            }
-          }, 3100);
-        } catch (err: any) {
-          const detail = err.response?.data?.detail || err.message || 'Unknown error';
-          cancelAutoApplyChain(`Auto Apply tailoring failed: ${detail}`);
-        }
+        proceedWithAutoApply(chainJobId);
       }
     } catch {
       alert('Failed to upload CV');
@@ -874,6 +871,7 @@ const App: React.FC = () => {
                         <strong>Auto Apply is running</strong>
                         <div className="text-sm text-muted" style={{ marginTop: '0.25rem' }}>
                           {autoApplyChain.phase === 'await_cv' && 'Step 1/3: Upload CV to continue.'}
+                          {autoApplyChain.phase === 'await_cv_update' && `Step 1/3: You have ${autoApplyChain.countdown}s to upload an updated CV, otherwise proceeding with the current one.`}
                           {autoApplyChain.phase === 'tailoring' && 'Step 2/3: Tailoring CV & cover letter…'}
                           {autoApplyChain.phase === 'countdown' && `Step 3/3: Starting bot in ${autoApplyChain.countdown}s (click Cancel to stop).`}
                           {autoApplyChain.phase === 'starting_bot' && 'Launching bot…'}
