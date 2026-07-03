@@ -521,9 +521,9 @@ def node_click_easy_apply(state: LinkedInState) -> dict:
             "a[data-control-name='jobdetails_topcard_inapply']",
             ".jobs-unified-top-card__content a.artdeco-button--primary",
             "a[aria-label*='Apply' i]:not([aria-label*='Easy' i])",
-            "xpath://a[contains(., 'Apply')]",
-            "xpath://span[contains(text(), 'Apply')]/ancestor::a",
-            "xpath://span[contains(text(), 'Apply')]/ancestor::button"
+            "xpath://div[contains(@class, 'jobs-unified-top-card')]//a[contains(., 'Apply')]",
+            "xpath://div[contains(@class, 'jobs-unified-top-card')]//span[contains(text(), 'Apply')]/ancestor::a",
+            "xpath://div[contains(@class, 'jobs-unified-top-card')]//span[contains(text(), 'Apply')]/ancestor::button"
         ]
         
         el = _find(driver, external_selectors, timeout=4)

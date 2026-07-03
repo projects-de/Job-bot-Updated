@@ -75,7 +75,7 @@ interface AppliedJob {
   cover_letter?: string;
 }
 
-type Tab = 'overview' | 'start';
+type Tab = 'overview' | 'start' | 'applied';
 type AutoApplyPhase = 'idle' | 'await_cv' | 'await_cv_update' | 'tailoring' | 'countdown' | 'starting_bot';
 
 const App: React.FC = () => {
@@ -701,6 +701,7 @@ const App: React.FC = () => {
       <nav className="tab-navigation">
         <button className={`tab-item ${activeTab === 'overview' ? 'active' : ''}`} onClick={() => setActiveTab('overview')}>Overview</button>
         <button className={`tab-item ${activeTab === 'start' ? 'active' : ''}`} onClick={() => setActiveTab('start')}>Start Application</button>
+        <button className={`tab-item ${activeTab === 'applied' ? 'active' : ''}`} onClick={() => setActiveTab('applied')}>Applied Jobs</button>
       </nav>
 
       <div className="app-content-wrapper">
@@ -761,21 +762,23 @@ const App: React.FC = () => {
               </div>
             </div>
 
-            <div className="overview-jobs-section">
-              <div className="list-header">
-                <h3>Applied Jobs</h3>
-                <span className="badge badge-warning">{appliedJobs.length} Applied</span>
-              </div>
-              {appliedJobs.length === 0 && (
+          </div>
+        )}
+
+        {activeTab === 'applied' && (
+          <div className="tab-pane applied-pane">
+            <h2 className="mb-4">Applied & Expired Jobs</h2>
+            <div className="applied-jobs-list">
+              {appliedJobs.length === 0 ? (
                 <div className="empty-state">
-                  <p>No submitted jobs yet.</p>
+                  <p>No submitted or expired jobs yet.</p>
                 </div>
-              )}
-              <div className="applied-jobs-list">
-                {appliedJobs.map((job) => {
+              ) : (
+                appliedJobs.map((job) => {
                   const expanded = expandedAppliedJobId === job.job_id;
+                  const isExpired = job.status === 'EXPIRED';
                   return (
-                    <div className="applied-job-card" key={job.job_id}>
+                    <div className={`applied-job-card ${isExpired ? 'border-danger-subtle' : ''}`} key={job.job_id}>
                       <div className="applied-job-top">
                         <div>
                           <h4 className="job-title">{job.job_title}</h4>
@@ -783,7 +786,11 @@ const App: React.FC = () => {
                           <div className="meta-info">
                             {job.source && <span>{job.source}</span>}
                             {job.location && <span><MapPin size={14} /> {job.location}</span>}
-                            {job.submitted_at && <span><CheckCircle size={14} /> Submitted: {job.submitted_at}</span>}
+                            {isExpired ? (
+                              <span className="text-danger"><CheckCircle size={14} /> Expired: {job.submitted_at || 'Unknown'}</span>
+                            ) : (
+                              job.submitted_at && <span className="text-success"><CheckCircle size={14} /> Submitted: {job.submitted_at}</span>
+                            )}
                           </div>
                         </div>
                         <button className="btn-small" onClick={() => setExpandedAppliedJobId(expanded ? null : job.job_id)}>
@@ -810,8 +817,8 @@ const App: React.FC = () => {
                       )}
                     </div>
                   );
-                })}
-              </div>
+                })
+              )}
             </div>
           </div>
         )}

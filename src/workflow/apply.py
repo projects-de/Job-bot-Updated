@@ -689,15 +689,70 @@ class SequentialApplier:
             review_event.clear()
             skip_event.clear()
 
-            # Wait for human signal
+            # Wait for human signal or auto-detect
             while not review_event.is_set() and not skip_event.is_set():
                 try:
-                    self.driver.title  # raises if browser was closed
-                except Exception:
+                    current_url = self.driver.current_url.lower()
+                    
+                    # 1. Check for expired linkedin job
+                    if 'linkedin.com' in current_url:
+                        try:
+                            body_el = self.driver.find_element(By.TAG_NAME, "body")
+                            if body_el and "no longer accepting applications" in body_el.text.lower():
+                                print(f"LinkedIn job expired for: {job_title}")
+                                log_application(job_id, job_title, company, JobStatus.EXPIRED, "No longer accepting applications")
+                                try:
+                                    self.driver.close()
+                                    if self.driver.window_handles:
+                                        self.driver.switch_to.window(self.driver.window_handles[0])
+                                except Exception:
+                                    pass
+                                return False
+                        except Exception:
+                            pass
+                            
+                    # 2. Check for manual submission detection
+                    is_submitted = False
+                    
+                    # URL change detection
+                    if any(word in current_url for word in ['success', 'thank', 'completed', 'submitted', 'post-apply']):
+                        is_submitted = True
+                    else:
+                        try:
+                            # JS event listener check
+                            js_detector = """
+                            if (!window.__bot_detector_injected) {
+                                window.__bot_detector_injected = true;
+                                window.__bot_form_submitted = false;
+                                document.addEventListener('click', function(e) {
+                                    let t = (e.target.innerText || e.target.value || e.target.getAttribute('aria-label') || '').toLowerCase();
+                                    if (t.includes('submit')) {
+                                        window.__bot_form_submitted = true;
+                                    }
+                                }, true);
+                                document.addEventListener('submit', function(e) {
+                                    window.__bot_form_submitted = true;
+                                }, true);
+                            }
+                            return window.__bot_form_submitted;
+                            """
+                            if self.driver.execute_script(js_detector):
+                                is_submitted = True
+                        except Exception:
+                            pass
+                            
+                    if is_submitted:
+                        print(f"Auto-detected submission for: {job_title}")
+                        review_event.set()
+                        break
+                        
+                    # Standard check to ensure browser is still open
+                    self.driver.title
+                except Exception as e:
                     print(f"Browser closed for: {job_title}")
                     log_application(job_id, job_title, company, JobStatus.TAILORED, "User closed browser before submit")
                     return False
-                time.sleep(1)
+                time.sleep(1.5)
 
             if skip_event.is_set():
                 print(f"Skipped: {job_title}")
