@@ -22,6 +22,8 @@ class JobStatus:
     READY = "READY"
     SUBMITTED = "SUBMITTED"
     FAILED = "FAILED"
+    EXPIRED = "EXPIRED"
+    SKIPPED = "SKIPPED"
 
 
 def _ensure_dirs():
@@ -159,6 +161,8 @@ def get_dashboard_stats() -> dict:
         JobStatus.READY: 0,
         JobStatus.SUBMITTED: 0,
         JobStatus.FAILED: 0,
+        JobStatus.EXPIRED: 0,
+        JobStatus.SKIPPED: 0,
     }
     for entry in apps:
         s = entry.get("status")
@@ -168,10 +172,15 @@ def get_dashboard_stats() -> dict:
     return {
         "total": len(apps),
         "discovered": counts[JobStatus.DISCOVERED],
-        "tailored": counts[JobStatus.TAILORED],
+        # A skipped job still went through tailoring (CV/cover letter were generated for
+        # it before the user reviewed and skipped it in-browser), so it counts toward the
+        # "Tailored" stat on the dashboard and appears in the Tailored Pipeline list too.
+        "tailored": counts[JobStatus.TAILORED] + counts[JobStatus.SKIPPED],
         "ready": counts[JobStatus.READY],
         "submitted": counts[JobStatus.SUBMITTED],
         "failed": counts[JobStatus.FAILED],
+        "expired": counts[JobStatus.EXPIRED],
+        "skipped": counts[JobStatus.SKIPPED],
         "last_scan_time": meta.get("last_scan_time"),
         "groq_api_usage": meta.get("groq_api_usage", 0)
     }

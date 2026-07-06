@@ -1,6 +1,6 @@
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 from apify_client import ApifyClient
@@ -75,7 +75,7 @@ def fetch_ziprecruiter_jobs_via_apify_api(options: Optional[Dict] = None) -> Lis
 
         run = client.actor(ZIPRECRUITER_ACTOR_ID).call(
             run_input=run_input,
-            timeout_secs=config.APIFY_TIMEOUT_SECONDS,
+            run_timeout=timedelta(seconds=config.APIFY_TIMEOUT_SECONDS),
             memory_mbytes=256,
         )
 

@@ -169,8 +169,9 @@ async def get_applied_jobs():
         job_index = _build_job_index()
 
         applied_jobs = []
+        terminal_statuses = (JobStatus.SUBMITTED, JobStatus.EXPIRED, JobStatus.SKIPPED)
         for app_entry in applications:
-            if app_entry.get("status") != JobStatus.SUBMITTED:
+            if app_entry.get("status") not in terminal_statuses:
                 continue
 
             job_id = str(app_entry.get("job_id") or "").strip()
@@ -410,7 +411,17 @@ def tailor_job(job_id: str):
 
 @app.get("/apply/status")
 async def get_apply_status():
-    return application_status
+    import time as _time
+    from src.workflow.apply import review_deadline_epoch, REVIEW_TIMEOUT_SECONDS
+
+    deadline = review_deadline_epoch["value"]
+    seconds_remaining = max(0, round(deadline - _time.time())) if deadline else None
+
+    return {
+        **application_status,
+        "review_timeout_seconds": REVIEW_TIMEOUT_SECONDS,
+        "seconds_remaining": seconds_remaining,
+    }
 
 @app.post("/apply/review/complete")
 async def review_complete():

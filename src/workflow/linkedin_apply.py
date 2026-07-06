@@ -43,20 +43,57 @@ class LinkedInState(TypedDict):
     login_done: bool
     result: str          # 'review_reached' | 'external' | 'failed' | 'already_applied'
     error: str
+    stuck_count: int      # consecutive Next-clicks that produced no visible modal change
 
 
 # ── Low-level Selenium helpers ────────────────────────────────────────────────
 
+# LinkedIn's current Easy Apply modal is a web component rendered inside an
+# OPEN shadow root (host: #interop-outlet). Regular find_element(s) calls never
+# cross that boundary, so every CSS query below is routed through this JS
+# helper, which searches both the main document and that shadow root.
+_SHADOW_QUERY_JS = """
+    const selector = arguments[0];
+    const textFilter = arguments[1];
+    const roots = [document];
+    const host = document.querySelector('#interop-outlet');
+    if (host && host.shadowRoot) roots.push(host.shadowRoot);
+    let results = [];
+    for (const root of roots) {
+        try { results = results.concat(Array.from(root.querySelectorAll(selector))); } catch (e) {}
+    }
+    if (textFilter) {
+        const tf = textFilter.toLowerCase();
+        results = results.filter(el => (el.textContent || '').toLowerCase().includes(tf));
+    }
+    return results;
+"""
+
+
+def _dom_query(driver, css_selector: str, text_contains: str = None) -> list:
+    """
+    CSS-selector query that also reaches into LinkedIn's Easy Apply shadow-DOM
+    web component, which driver.find_elements(By.CSS_SELECTOR, ...) can't see.
+    Optionally filters results to elements whose text contains `text_contains`.
+    """
+    try:
+        return driver.execute_script(_SHADOW_QUERY_JS, css_selector, text_contains) or []
+    except Exception:
+        return []
+
+
 def _find(driver, selectors: list, timeout: float = 6):
-    """Return first visible element matching any selector (CSS or XPath), or None."""
+    """Return first visible element matching any selector (CSS, shadow-aware CSS, or XPath), or None."""
     deadline = time.time() + timeout
     print(f"  [DEBUG] Searching for selectors: {selectors}")
     while time.time() < deadline:
         for sel in selectors:
             try:
-                by_type = By.XPATH if sel.startswith("/") or sel.startswith("xpath:") else By.CSS_SELECTOR
-                actual_sel = sel[6:] if sel.startswith("xpath:") else sel
-                elements = driver.find_elements(by_type, actual_sel)
+                if sel.startswith("/") or sel.startswith("xpath:"):
+                    actual_sel = sel[6:] if sel.startswith("xpath:") else sel
+                    elements = driver.find_elements(By.XPATH, actual_sel)
+                else:
+                    elements = _dom_query(driver, sel)
                 if elements:
                     print(f"  [DEBUG] Selector '{sel}' matched {len(elements)} elements.")
                     for i, el in enumerate(elements):
@@ -152,7 +189,7 @@ def _fill_any(driver, selectors: list, value: str, skip_if_filled=True) -> bool:
     """Fill first visible matching element. Skips if already has a value."""
     for sel in selectors:
         try:
-            for el in driver.find_elements(By.CSS_SELECTOR, sel):
+            for el in _dom_query(driver, sel):
                 if not el.is_displayed():
                     continue
                 if skip_if_filled and (el.get_attribute("value") or "").strip():
@@ -198,11 +235,36 @@ def _click(driver, selectors: list, label: str = "", timeout: float = 8) -> bool
         return False
 
 
+def _click_shadow_by_text(driver, tag: str, texts: list, label: str = "") -> bool:
+    """Find and click a shadow-DOM-aware element by tag + text content match (case-insensitive)."""
+    for text in texts:
+        for el in _dom_query(driver, tag, text_contains=text):
+            try:
+                if not (el.is_displayed() and el.is_enabled()):
+                    continue
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                time.sleep(0.2)
+                try:
+                    el.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", el)
+                if label:
+                    print(f"    [OK] Clicked (shadow-aware text match): {label} ('{text}')")
+                time.sleep(1.5)
+                return True
+            except Exception:
+                pass
+    return False
+
+
+MODAL_SELECTORS = [".jobs-easy-apply-modal", "div[role='dialog']", ".artdeco-modal", "[aria-modal='true']", "dialog"]
+
+
 def _modal_text(driver) -> str:
     """Extract visible text from the Easy Apply modal (capped at 2000 chars)."""
-    for sel in [".jobs-easy-apply-modal", "div[role='dialog']", ".artdeco-modal"]:
+    for sel in MODAL_SELECTORS:
         try:
-            for el in driver.find_elements(By.CSS_SELECTOR, sel):
+            for el in _dom_query(driver, sel):
                 if el.is_displayed():
                     return el.text[:2000]
         except Exception:
@@ -217,9 +279,9 @@ def _modal_fields(driver) -> list:
     """
     fields = []
     modal = None
-    for sel in [".jobs-easy-apply-modal", "div[role='dialog']", ".artdeco-modal"]:
+    for sel in MODAL_SELECTORS:
         try:
-            for el in driver.find_elements(By.CSS_SELECTOR, sel):
+            for el in _dom_query(driver, sel):
                 if el.is_displayed():
                     modal = el
                     break
@@ -247,7 +309,7 @@ def _modal_fields(driver) -> list:
                 label_text = ""
                 if iid:
                     try:
-                        lbl = driver.find_element(By.CSS_SELECTOR, f"label[for='{iid}']")
+                        lbl = modal.find_element(By.CSS_SELECTOR, f"label[for='{iid}']")
                         label_text = lbl.text.strip()
                     except Exception:
                         pass
@@ -328,7 +390,7 @@ def _is_review_page(driver) -> bool:
     ]
     for sel in review_selectors:
         try:
-            if any(e.is_displayed() for e in driver.find_elements(By.CSS_SELECTOR, sel)):
+            if any(e.is_displayed() for e in _dom_query(driver, sel)):
                 return True
         except Exception:
             pass
@@ -398,8 +460,9 @@ def _apply_llm_answers(driver, answers: list):
         if not fid or not val:
             continue
         try:
-            el = driver.find_element(By.ID, fid)
-            if not el.is_displayed():
+            matches = _dom_query(driver, f'[id="{fid}"]')
+            el = matches[0] if matches else None
+            if not el or not el.is_displayed():
                 continue
             tag = el.tag_name.lower()
             itype = (el.get_attribute("type") or "").lower()
@@ -500,6 +563,12 @@ def node_click_easy_apply(state: LinkedInState) -> dict:
     print("  [LinkedIn Agent] Running node_click_easy_apply...")
 
     easy_apply_selectors = [
+        # LinkedIn currently renders the Easy Apply control as an <a>, not a <button>,
+        # identified reliably by its aria-label (class names are hashed/obfuscated per load).
+        "a[aria-label*='Easy Apply' i]",
+        "xpath://a[contains(@aria-label, 'Easy Apply')]",
+        "xpath://span[contains(text(), 'Easy Apply')]/ancestor::a",
+        # Older/alternate LinkedIn layouts render it as a <button> — kept as fallbacks.
         "button.jobs-apply-button",
         "button[aria-label*='Easy Apply' i]",
         ".jobs-apply-button--top-card",
@@ -548,7 +617,7 @@ def node_click_easy_apply(state: LinkedInState) -> dict:
     time.sleep(2)
 
     # Verify modal opened
-    modal = _find(driver, [".jobs-easy-apply-modal", "div[role='dialog']", ".artdeco-modal"], timeout=6)
+    modal = _find(driver, MODAL_SELECTORS, timeout=6)
     if not modal:
         return {"result": "failed", "error": "Easy Apply modal did not open after clicking"}
 
@@ -622,7 +691,7 @@ def node_fill_step(state: LinkedInState) -> dict:
     cv_filepath = state.get("cv_filepath", "")
     if cv_filepath and os.path.exists(cv_filepath):
         try:
-            file_inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='file']")
+            file_inputs = _dom_query(driver, "input[type='file']")
             for fi in file_inputs:
                 try:
                     fi.send_keys(os.path.abspath(cv_filepath))
@@ -660,14 +729,14 @@ def node_fill_step(state: LinkedInState) -> dict:
 
     # ── 5. Fallback: radio Yes/No groups ──────────────────────────────────────
     try:
-        radios = driver.find_elements(By.CSS_SELECTOR, "input[type='radio']")
+        radios = _dom_query(driver, "input[type='radio']")
         for radio in radios:
             try:
                 rid = radio.get_attribute("id") or ""
                 val = (radio.get_attribute("value") or "").lower()
                 label_text = ""
                 if rid:
-                    lbls = driver.find_elements(By.CSS_SELECTOR, f"label[for='{rid}']")
+                    lbls = _dom_query(driver, f'label[for="{rid}"]')
                     if lbls:
                         label_text = lbls[0].text.lower()
                 if ("yes" in label_text or val == "yes") and not radio.is_selected():
@@ -684,6 +753,7 @@ def node_fill_step(state: LinkedInState) -> dict:
 def node_advance(state: LinkedInState) -> dict:
     """Click the Next / Continue button to move to the next modal step."""
     driver = state["driver"]
+    text_before = _modal_text(driver)
 
     next_selectors = [
         "button[aria-label*='Continue to next step' i]",
@@ -699,11 +769,19 @@ def node_advance(state: LinkedInState) -> dict:
     clicked = _click(driver, next_selectors, "Next step", timeout=5)
 
     if not clicked:
+        # Fallback: shadow-DOM-aware text match — the modal's Next/Review button
+        # lives inside LinkedIn's Easy Apply web component (shadow root), where
+        # plain XPath text-matching selectors above can't reach.
+        clicked = _click_shadow_by_text(
+            driver, "button",
+            ["continue to next step", "next", "review your application", "review", "submit application"],
+            "Next/Review button"
+        )
+
+    if not clicked:
         # Fallback: click the primary button in the modal footer
         try:
-            modal_btns = driver.find_elements(
-                By.CSS_SELECTOR, ".jobs-easy-apply-modal footer button, div[role='dialog'] footer button"
-            )
+            modal_btns = _dom_query(driver, ".jobs-easy-apply-modal footer button, div[role='dialog'] footer button, footer button")
             for btn in reversed(modal_btns):
                 txt = (btn.text or "").strip().lower()
                 aria = (btn.get_attribute("aria-label") or "").lower()
@@ -716,8 +794,26 @@ def node_advance(state: LinkedInState) -> dict:
         except Exception:
             pass
 
+    # Detect a stuck step: clicked something, but the modal content didn't change
+    # at all (seen with some third-party ATS embeds, e.g. Greenhouse, where the
+    # Next click is silently ignored). Fail fast instead of burning all max_steps.
+    stuck_count = state.get("stuck_count", 0)
+    if clicked and text_before and _modal_text(driver) == text_before:
+        stuck_count += 1
+    else:
+        stuck_count = 0
+
+    if stuck_count >= 2:
+        return {
+            "step_count": state["step_count"] + 1,
+            "stuck_count": stuck_count,
+            "result": "failed",
+            "error": "Next button click had no effect after repeated attempts — this application may use a "
+                     "third-party form that needs manual completion.",
+        }
+
     # Increment step_count by 1 to avoid infinite loop locks
-    return {"step_count": state["step_count"] + 1}
+    return {"step_count": state["step_count"] + 1, "stuck_count": stuck_count}
 
 
 def node_review(state: LinkedInState) -> dict:
@@ -772,6 +868,8 @@ def _route_after_fill(state: LinkedInState) -> str:
 
 def _route_after_advance(state: LinkedInState) -> str:
     driver = state["driver"]
+    if state.get("result") == "failed":
+        return "handle_error"
     if _is_review_page(driver):
         return "review"
     if state["step_count"] >= state["max_steps"]:
@@ -858,6 +956,7 @@ def run_linkedin_agent(
         "login_done": False,
         "result": "",
         "error": "",
+        "stuck_count": 0,
     }
     final = _graph.invoke(initial)
     return final.get("result", "failed")

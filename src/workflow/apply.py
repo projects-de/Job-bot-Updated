@@ -2,13 +2,16 @@ import json
 import os
 import time
 import threading
-import undetected_chromedriver as uc
+from selenium import webdriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
 
-from src.config import USER_AGENT, CANDIDATE_EMAIL
+from langchain_groq import ChatGroq
+from langchain_core.messages import HumanMessage
+
+from src.config import USER_AGENT, CANDIDATE_EMAIL, GROQ_API_KEY
 from src.storage.tracker import log_application, save_tailored_application, JobStatus, APPLICATIONS_DIR, UPLOADS_DIR
 from src.workflow.optimize import render_tailored_cv_latex
 from src.workflow.indeed_apply import IndeedApplier, _is_indeed_url
@@ -18,6 +21,32 @@ import glob
 # Global events for human-in-the-loop review
 review_event = threading.Event()
 skip_event = threading.Event()
+
+# Sets an <input>/<textarea>'s value through the element's native property setter
+# (bypassing React/Vue's overridden setter) and fires input/change events, so
+# framework-controlled fields actually register the change instead of silently
+# keeping their old content — plain `.value = x` or Ctrl+A/Backspace alone can
+# fail to clear these, leaving newly-typed text appended after stale content.
+_NATIVE_SET_VALUE_JS = """
+    const el = arguments[0];
+    const value = arguments[1];
+    const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+    const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (descriptor && descriptor.set) {
+        descriptor.set.call(el, value);
+    } else {
+        el.value = value;
+    }
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+"""
+
+REVIEW_TIMEOUT_SECONDS = 180
+
+# Epoch time the current review-wait period expires, or None when no job is
+# currently waiting on human review. A plain dict (not a module-level float) so
+# the API layer can import and read it live without a getter function.
+review_deadline_epoch = {"value": None}
 
 
 def _load_tailored_for_job(job_id):
@@ -132,6 +161,16 @@ def _generate_cv_text_file(cv_data, job_id):
     return filepath
 
 
+def _generate_cover_letter_text_file(cover_letter, job_id):
+    """Generate a plain-text .txt file of the cover letter for form file uploads."""
+    temp_dir = os.path.join(APPLICATIONS_DIR, job_id)
+    os.makedirs(temp_dir, exist_ok=True)
+    filepath = os.path.join(temp_dir, "cover_letter.txt")
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(cover_letter or "")
+    return filepath
+
+
 def _get_latest_uploaded_resume():
     """Return the absolute path to the latest uploaded PDF or DOCX resume in UPLOADS_DIR."""
     if not os.path.exists(UPLOADS_DIR):
@@ -147,40 +186,6 @@ def _get_latest_uploaded_resume():
     # Sort by modification time desc
     files.sort(key=os.path.getmtime, reverse=True)
     return files[0]
-def get_chrome_major_version():
-    """Retrieve the installed Google Chrome major version on Windows."""
-    try:
-        import winreg
-        # Try Current User registry
-        try:
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Google\Chrome\BLBeacon")
-            version, _ = winreg.QueryValueEx(key, "version")
-            winreg.CloseKey(key)
-            if version:
-                return int(version.split('.')[0])
-        except Exception:
-            pass
-        # Try Local Machine registry (Wow6432Node)
-        try:
-            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Google Chrome")
-            version, _ = winreg.QueryValueEx(key, "DisplayVersion")
-            winreg.CloseKey(key)
-            if version:
-                return int(version.split('.')[0])
-        except Exception:
-            pass
-        # Try another Local Machine location
-        try:
-            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Google Chrome")
-            version, _ = winreg.QueryValueEx(key, "DisplayVersion")
-            winreg.CloseKey(key)
-            if version:
-                return int(version.split('.')[0])
-        except Exception:
-            pass
-    except Exception as e:
-        print(f"Registry chrome version check failed: {e}")
-    return None
 
 
 class SequentialApplier:
@@ -192,54 +197,32 @@ class SequentialApplier:
 
     def init_browser(self):
         if not self.driver:
-            options = uc.ChromeOptions()
+            options = webdriver.ChromeOptions()
             options.add_argument('--no-sandbox')
             options.add_argument('--disable-dev-shm-usage')
             options.add_argument('--disable-blink-features=AutomationControlled')
             options.add_argument('--disable-popup-blocking')
-            
+            options.add_experimental_option('excludeSwitches', ['enable-automation'])
+            options.add_experimental_option('useAutomationExtension', False)
+
             # Onboarding & first-run suppression to bypass welcome/What's New screens
             options.add_argument('--no-first-run')
             options.add_argument('--no-default-browser-check')
             options.add_argument('--disable-features=ChromeWhatsNewUI')
             options.add_argument('--disable-whats-new-ui')
             options.add_argument('--disable-welcome-ui')
-            
-            # Using persistent user data directory
+
+            # Using persistent user data directory (same profile undetected-chromedriver used,
+            # so existing LinkedIn/Indeed logins carry over)
             user_data_dir = os.path.join(os.getcwd(), "user_data_uc")
             os.makedirs(user_data_dir, exist_ok=True)
             options.add_argument(f"--user-data-dir={user_data_dir}")
-            
-            major_ver = get_chrome_major_version()
-            if major_ver:
-                print(f"Detected installed Chrome major version: {major_ver}")
-            
-            try:
-                if major_ver:
-                    print(f"Launching undetected-chromedriver with version_main={major_ver}...")
-                    self.driver = uc.Chrome(options=options, version_main=major_ver, suppress_welcome=True)
-                else:
-                    print("Could not detect Chrome version. Launching with default undetected-chromedriver...")
-                    self.driver = uc.Chrome(options=options, suppress_welcome=True)
-            except Exception as e:
-                err_msg = str(e)
-                print(f"Initial undetected-chromedriver launch failed: {err_msg}")
-                # Fallback: parse current version from the exception error string
-                import re
-                match = re.search(r"Current browser version is ([\d\.]+)", err_msg)
-                if match:
-                    version_str = match.group(1)
-                    parsed_ver = int(version_str.split('.')[0])
-                    print(f"Extracted actual Chrome major version from exception: {parsed_ver}. Retrying launch...")
-                    try:
-                        self.driver = uc.Chrome(options=options, version_main=parsed_ver, suppress_welcome=True)
-                    except Exception as retry_err:
-                        print(f"Retry launch with version_main={parsed_ver} failed: {retry_err}")
-                        raise retry_err
-                else:
-                    raise e
-            
-            # Deep stealth overriding
+
+            # Selenium Manager (built into Selenium 4.6+) auto-resolves a chromedriver
+            # build matching whatever Chrome version is actually installed.
+            self.driver = webdriver.Chrome(options=options)
+
+            # Stealth overriding
             self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
                 "source": """
                     Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
@@ -248,28 +231,54 @@ class SequentialApplier:
                 """
             })
 
-    def _try_fill(self, selector, value):
-        """Try to fill a form field matching the selector, returns True if found."""
+    def _try_fill(self, selector, value, skip_if_filled=True):
+        """
+        Try to fill a form field matching the selector, returns True if found.
+        Skips elements that already hold a value by default — without this, a later,
+        broader selector (e.g. the address fallback matching an "Email address"
+        placeholder) can silently overwrite a field an earlier, more specific
+        selector already filled correctly.
+        """
         try:
             by_type = By.XPATH if selector.startswith("/") or selector.startswith("xpath:") else By.CSS_SELECTOR
             actual_sel = selector[6:] if selector.startswith("xpath:") else selector
             elements = self.driver.find_elements(by_type, actual_sel)
             for el in elements:
                 if el.is_displayed():
+                    if skip_if_filled and (el.get_attribute("value") or "").strip():
+                        continue
                     self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
                     time.sleep(0.15)
                     try:
                         el.click()
                     except:
                         pass
-                    # Use keys-based clear to trigger React/Vue synthetic events reliably
+                    # Force-clear via the framework-aware native setter first. Keyboard-only
+                    # clearing (Ctrl+A/Backspace) can silently fail on some custom/masked
+                    # React inputs, leaving old content in place for new keystrokes to land
+                    # after instead of replacing.
+                    try:
+                        self.driver.execute_script(_NATIVE_SET_VALUE_JS, el, "")
+                    except Exception:
+                        pass
                     try:
                         el.send_keys(Keys.CONTROL + "a")
                         el.send_keys(Keys.BACKSPACE)
                     except Exception:
-                        el.clear()
+                        try:
+                            el.clear()
+                        except Exception:
+                            pass
                     time.sleep(0.1)
                     el.send_keys(str(value))
+                    # Verify the field actually holds exactly what was typed — if a
+                    # framework re-render restored stale content mid-type, force it directly.
+                    final_value = (el.get_attribute("value") or "").strip()
+                    if final_value != str(value).strip():
+                        try:
+                            self.driver.execute_script(_NATIVE_SET_VALUE_JS, el, str(value))
+                        except Exception:
+                            pass
                     print(f"  [OK] Filled field: '{selector}' -> '{value}'")
                     return True
         except Exception as e:
@@ -283,35 +292,53 @@ class SequentialApplier:
                 return True
         return False
 
-    def _try_upload_file(self, filepath):
-        """Try to find a file input and upload the CV file."""
+    def _try_upload_file(self, filepath, kind="resume"):
+        """
+        Try to find a file input and upload a file into it. `kind` is "resume" or
+        "cover_letter" — used to prefer the matching input when a form has more than
+        one file field, and each input is marked after use so resume/cover-letter
+        uploads never collide on the same field.
+        """
         try:
-            file_selectors = [
-                "input[type='file']",
-                "input[type='file'][name*='cv' i]",
-                "input[type='file'][name*='resume' i]",
-                "input[type='file'][id*='cv' i]",
-                "input[type='file'][id*='resume' i]",
-                "input[type='file'][accept*='pdf' i]",
-                "input[type='file'][accept*='doc' i]",
-            ]
+            if kind == "cover_letter":
+                preferred_selectors = [
+                    "input[type='file'][name*='cover' i]",
+                    "input[type='file'][id*='cover' i]",
+                    "input[type='file'][aria-label*='cover' i]",
+                ]
+            else:
+                preferred_selectors = [
+                    "input[type='file'][name*='cv' i]",
+                    "input[type='file'][name*='resume' i]",
+                    "input[type='file'][id*='cv' i]",
+                    "input[type='file'][id*='resume' i]",
+                    "input[type='file'][aria-label*='resume' i]",
+                    "input[type='file'][aria-label*='cv' i]",
+                    "input[type='file'][accept*='pdf' i]",
+                    "input[type='file'][accept*='doc' i]",
+                ]
 
-            for selector in file_selectors:
-                elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+            def _unfilled(elements):
+                return [el for el in elements if not el.get_attribute("data-bot-uploaded")]
+
+            for selector in preferred_selectors:
+                elements = _unfilled(self.driver.find_elements(By.CSS_SELECTOR, selector))
                 if elements:
-                    # Input type=file doesn't need to be displayed to accept keys
                     elements[0].send_keys(os.path.abspath(filepath))
-                    print(f"  [OK] Uploaded CV file via: {selector}")
+                    self.driver.execute_script("arguments[0].setAttribute('data-bot-uploaded', '1');", elements[0])
+                    print(f"  [OK] Uploaded {kind} file via: {selector}")
                     return True
 
-            all_file_inputs = self.driver.find_elements(By.CSS_SELECTOR, "input[type='file']")
-            if all_file_inputs:
-                all_file_inputs[0].send_keys(os.path.abspath(filepath))
-                print(f"  [OK] Uploaded CV file via first file input")
-                return True
+            if kind == "resume":
+                all_file_inputs = _unfilled(self.driver.find_elements(By.CSS_SELECTOR, "input[type='file']"))
+                if all_file_inputs:
+                    all_file_inputs[0].send_keys(os.path.abspath(filepath))
+                    self.driver.execute_script("arguments[0].setAttribute('data-bot-uploaded', '1');", all_file_inputs[0])
+                    print(f"  [OK] Uploaded {kind} file via first unfilled file input")
+                    return True
 
         except Exception as e:
-            print(f"  [WARN] File upload failed: {e}")
+            print(f"  [WARN] File upload failed ({kind}): {e}")
         return False
 
     def _click_initial_apply_button(self):
@@ -366,171 +393,512 @@ class SequentialApplier:
         print("  [WARN] No initial apply button found or clicked.")
         return False
 
-    def fill_form(self, tailored_cv, cover_letter, cv_filepath=None):
+    def _fill_identity_and_links(self, tailored_cv):
+        """Deterministic pass: name, email, phone, address/location, and profile links."""
+        full_name = tailored_cv.get("full_name", "")
+        email = tailored_cv.get("email", "") or CANDIDATE_EMAIL
+        phone = tailored_cv.get("phone", "")
+        location = tailored_cv.get("location", "")
+        summary = tailored_cv.get("summary", "")
+
+        name_parts = full_name.split() if full_name else []
+        first_name = name_parts[0] if name_parts else ""
+        last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
+
+        self._try_fill_any([
+            "input[name*='full_name' i]", "input[id*='full_name' i]",
+            "input[name*='fullname' i]", "input[id*='fullname' i]",
+            "input[name*='display_name' i]", "input[id*='display_name' i]",
+            "input[name*='name' i][name*='full' i]",
+            "input[placeholder*='full name' i]",
+        ], full_name)
+
+        self._try_fill_any([
+            "input[name*='first_name' i]", "input[id*='first_name' i]",
+            "input[name*='firstname' i]", "input[id*='firstname' i]",
+            "input[name*='given' i]", "input[id*='given' i]",
+            "input[placeholder*='first name' i]",
+        ], first_name)
+
+        self._try_fill_any([
+            "input[name*='last_name' i]", "input[id*='last_name' i]",
+            "input[name*='lastname' i]", "input[id*='lastname' i]",
+            "input[name*='surname' i]", "input[id*='surname' i]",
+            "input[name*='family' i]", "input[id*='family' i]",
+            "input[placeholder*='last name' i]",
+        ], last_name)
+
+        self._try_fill_any([
+            "input[type='email']",
+            "input[name*='email' i]", "input[id*='email' i]",
+            "input[placeholder*='email' i]",
+        ], email)
+
+        if phone:
+            self._try_fill_any([
+                "input[type='tel']",
+                "input[name*='phone' i]", "input[id*='phone' i]",
+                "input[name*='mobile' i]", "input[id*='mobile' i]",
+                "input[name*='telephone' i]", "input[id*='telephone' i]",
+                "input[placeholder*='phone' i]", "input[placeholder*='mobile' i]",
+            ], phone)
+
+        if location:
+            # Covers plain "location/city" fields as well as street-address-style
+            # fields (Workday/Greenhouse/Lensa commonly ask "Address"/"Address Line 1").
+            # Explicitly excludes anything mentioning "email" — a placeholder like
+            # "Email address" contains the substring "address" and would otherwise
+            # match these selectors and get overwritten with the location value.
+            self._try_fill_any([
+                "input[name*='location' i]:not([name*='email' i])",
+                "input[id*='location' i]:not([id*='email' i])",
+                "input[name*='city' i]:not([name*='email' i])",
+                "input[id*='city' i]:not([id*='email' i])",
+                "input[name*='address' i]:not([name*='email' i])",
+                "input[id*='address' i]:not([id*='email' i])",
+                "input[name*='street' i]:not([name*='email' i])",
+                "input[id*='street' i]:not([id*='email' i])",
+                "input[placeholder*='city' i]:not([placeholder*='email' i])",
+                "input[placeholder*='address' i]:not([placeholder*='email' i]):not([type='email'])",
+                "input[placeholder*='location' i]:not([placeholder*='email' i])",
+            ], location)
+
+        links = tailored_cv.get('links', [])
+        if isinstance(links, list):
+            for link in links:
+                l_lower = link.lower()
+                if 'linkedin' in l_lower:
+                    self._try_fill_any([
+                        "input[name*='linkedin' i]", "input[id*='linkedin' i]",
+                        "input[placeholder*='linkedin' i]",
+                        "input[name*='link' i][name*='in' i]",
+                    ], link)
+                elif 'github' in l_lower:
+                    self._try_fill_any([
+                        "input[name*='github' i]", "input[id*='github' i]",
+                        "input[placeholder*='github' i]",
+                        "input[name*='git' i]",
+                    ], link)
+                elif 'portfolio' in l_lower or 'website' in l_lower:
+                    self._try_fill_any([
+                        "input[name*='portfolio' i]", "input[id*='portfolio' i]",
+                        "input[name*='website' i]", "input[id*='website' i]",
+                        "input[placeholder*='website' i]",
+                        "input[placeholder*='portfolio' i]",
+                        "input[name*='personal' i][name*='site' i]",
+                    ], link)
+
+        if summary:
+            self._try_fill_any([
+                "textarea[name*='summary' i]", "textarea[id*='summary' i]",
+                "textarea[name*='about' i]", "textarea[id*='about' i]",
+                "textarea[placeholder*='summary' i]",
+            ], summary)
+
+    def _click_consent_checkboxes(self):
         try:
-            # 0. Try clicking the initial Apply button if the site requires a transition first
+            consent_selectors = [
+                "input[type='checkbox'][name*='privacy' i]",
+                "input[type='checkbox'][name*='consent' i]",
+                "input[type='checkbox'][name*='terms' i]",
+                "input[type='checkbox'][id*='privacy' i]",
+                "input[type='checkbox'][id*='consent' i]",
+                "input[type='checkbox'][id*='agree' i]",
+                "input[type='checkbox'][value*='agree' i]",
+            ]
+            for sel in consent_selectors:
+                for el in self.driver.find_elements(By.CSS_SELECTOR, sel):
+                    if el.is_displayed() and not el.is_selected():
+                        self.driver.execute_script("arguments[0].click();", el)
+                        print(f"  [OK] Clicked consent checkbox: {sel}")
+        except Exception as ce:
+            print(f"  [WARN] Checkbox clicking error: {ce}")
+
+    def _fill_known_dropdowns(self):
+        """Rule-based auto-fill for the two dropdown questions we can always answer safely."""
+        try:
+            select_elements = self.driver.find_elements(By.CSS_SELECTOR, "select")
+            for sel in select_elements:
+                if not sel.is_displayed():
+                    continue
+                aria = (sel.get_attribute("aria-label") or "").lower()
+                name = (sel.get_attribute("name") or "").lower()
+                text_content = (sel.text or "").lower()
+
+                is_sponsorship = any(k in aria or k in name or k in text_content for k in ("sponsor", "visa", "sponsorship"))
+                is_auth = any(k in aria or k in name or k in text_content for k in ("authorized", "legally", "permit"))
+
+                sel_obj = Select(sel)
+
+                if is_sponsorship:
+                    for opt in sel_obj.options:
+                        opt_text = (opt.text or "").lower()
+                        if opt_text.strip() in ("no", "false", "n"):
+                            sel_obj.select_by_visible_text(opt.text)
+                            print(f"  [OK] Sponsorship dropdown auto-filled: {opt.text}")
+                            break
+                elif is_auth:
+                    for opt in sel_obj.options:
+                        opt_text = (opt.text or "").lower()
+                        if opt_text.strip() in ("yes", "true", "y"):
+                            sel_obj.select_by_visible_text(opt.text)
+                            print(f"  [OK] Work Auth dropdown auto-filled: {opt.text}")
+                            break
+        except Exception as se:
+            print(f"  [WARN] Dropdown auto-filling error: {se}")
+
+    def _field_label(self, el):
+        try:
+            eid = el.get_attribute("id") or ""
+            if eid:
+                try:
+                    lbl = self.driver.find_element(By.CSS_SELECTOR, f"label[for='{eid}']")
+                    if lbl.text.strip():
+                        return lbl.text.strip()
+                except Exception:
+                    pass
+            try:
+                anc = el.find_element(By.XPATH, "ancestor::label")
+                if anc.text.strip():
+                    return anc.text.strip()
+            except Exception:
+                pass
+            return el.get_attribute("aria-label") or el.get_attribute("placeholder") or ""
+        except Exception:
+            return ""
+
+    def _collect_unfilled_fields(self):
+        """
+        Scan the whole page for visible fields still needing a value/selection —
+        including arbitrary <select> dropdowns, radio groups, and checkboxes beyond
+        the deterministic identity/consent/sponsorship ones already handled — so the
+        LLM pass below can answer them intelligently from the CV.
+        """
+        fields = []
+        seen_radio_groups = set()
+        try:
+            elements = self.driver.find_elements(
+                By.CSS_SELECTOR,
+                "input:not([type='hidden']):not([type='file']), select, textarea"
+            )
+            for el in elements:
+                try:
+                    if not el.is_displayed():
+                        continue
+                    tag = el.tag_name.lower()
+                    itype = (el.get_attribute("type") or tag).lower()
+                    name = el.get_attribute("name") or ""
+                    eid = el.get_attribute("id") or ""
+
+                    if itype == "radio":
+                        group_key = name or eid
+                        if not group_key or group_key in seen_radio_groups:
+                            continue
+                        seen_radio_groups.add(group_key)
+                        group_radios = (
+                            self.driver.find_elements(By.CSS_SELECTOR, f"input[type='radio'][name='{name}']")
+                            if name else [el]
+                        )
+                        if any(r.is_selected() for r in group_radios):
+                            continue
+                        options = []
+                        for r in group_radios:
+                            rid = r.get_attribute("id") or ""
+                            label = ""
+                            if rid:
+                                try:
+                                    label = self.driver.find_element(By.CSS_SELECTOR, f"label[for='{rid}']").text.strip()
+                                except Exception:
+                                    pass
+                            label = label or r.get_attribute("value") or ""
+                            if label:
+                                options.append(label)
+                        if options:
+                            fields.append({"kind": "radio", "label": self._field_label(el), "name": name, "id": "", "options": options})
+                        continue
+
+                    if itype == "checkbox":
+                        if el.is_selected():
+                            continue
+                        fields.append({"kind": "checkbox", "label": self._field_label(el), "name": name, "id": eid, "options": ["check", "leave unchecked"]})
+                        continue
+
+                    if tag == "select":
+                        try:
+                            selected_text = Select(el).first_selected_option.text.strip()
+                        except Exception:
+                            selected_text = ""
+                        if selected_text and selected_text.lower() not in ("select...", "select one", "please select", "-- select --", ""):
+                            continue
+                        try:
+                            options = [o.text.strip() for o in Select(el).options if o.text.strip()]
+                        except Exception:
+                            options = []
+                        if not options:
+                            continue
+                        fields.append({"kind": "select", "label": self._field_label(el), "name": name, "id": eid, "options": options})
+                        continue
+
+                    current = (el.get_attribute("value") or "").strip()
+                    if current:
+                        continue
+                    label_text = self._field_label(el)
+                    if not label_text:
+                        continue
+                    fields.append({"kind": "text", "label": label_text, "name": name, "id": eid, "options": None})
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return fields
+
+    def _llm_answer_fields(self, cv_data, fields, page_text):
+        """Ask Groq to answer remaining unfilled fields (dropdowns, radios, open text) from the CV."""
+        if not GROQ_API_KEY or not fields:
+            return []
+        try:
+            llm = ChatGroq(api_key=GROQ_API_KEY, model="llama-3.3-70b-versatile", temperature=0)
+            prompt = f"""You are a job application assistant filling out an external company application form
+(not LinkedIn/Indeed's own flow — this is a company careers site or ATS like Greenhouse/Workday/Lensa).
+
+CURRENT PAGE TEXT (for context):
+{page_text[:1200]}
+
+VISIBLE UNFILLED FIELDS:
+{json.dumps(fields, indent=2)}
+
+CANDIDATE CV:
+{json.dumps(cv_data, indent=2)}
+
+TASK: Return the correct value for each field based ONLY on the candidate's CV.
+Rules:
+- For "select"/"radio" fields, you MUST return one of the exact strings listed in that field's "options".
+- For "checkbox" fields, return "check" only for standard consent/terms/privacy-policy acknowledgements; otherwise "leave unchecked".
+- "years of experience" -> calculate conservatively from CV dates.
+- work authorization / eligibility -> pick the option meaning "Yes".
+- visa sponsorship required -> pick the option meaning "No".
+- "how did you hear about us" -> pick "LinkedIn" or the closest option.
+- salary / compensation expectations -> leave empty ("").
+- open-text questions -> 1-2 sentences using CV evidence only, never fabricate.
+- if a field can't be answered from the CV -> return "".
+
+Return a JSON array ONLY, no explanation, matching each field by "id" (or "name" if it has no id):
+[{{"id": "field_id_or_empty", "name": "field_name_or_empty", "value": "answer"}}, ...]"""
+
+            response = llm.invoke([HumanMessage(content=prompt)])
+            text = response.content.strip()
+            if "[" in text and "]" in text:
+                text = text[text.find("["):text.rfind("]") + 1]
+            return json.loads(text)
+        except Exception as e:
+            print(f"  [WARN] LLM form-answer error: {e}")
+            return []
+
+    def _apply_llm_field_answers(self, answers):
+        for item in answers:
+            fid = (item.get("id") or "").strip()
+            fname = (item.get("name") or "").strip()
+            val = item.get("value", "")
+            if not val or (not fid and not fname):
+                continue
+            try:
+                el = None
+                if fid:
+                    matches = self.driver.find_elements(By.CSS_SELECTOR, f"[id='{fid}']")
+                    el = matches[0] if matches else None
+                if not el and fname:
+                    matches = self.driver.find_elements(By.CSS_SELECTOR, f"[name='{fname}']")
+                    if matches and (matches[0].get_attribute("type") or "").lower() != "radio":
+                        el = matches[0]
+
+                if el and el.is_displayed():
+                    tag = el.tag_name.lower()
+                    itype = (el.get_attribute("type") or "").lower()
+                    if tag == "select":
+                        sel_obj = Select(el)
+                        try:
+                            sel_obj.select_by_visible_text(val)
+                            print(f"  [OK] LLM-filled dropdown '{fid or fname}' -> '{val}'")
+                        except Exception:
+                            for opt in sel_obj.options:
+                                if opt.text.strip().lower() == val.strip().lower():
+                                    sel_obj.select_by_visible_text(opt.text)
+                                    break
+                    elif itype == "checkbox":
+                        if val.lower() == "check" and not el.is_selected():
+                            self.driver.execute_script("arguments[0].click();", el)
+                            print(f"  [OK] LLM-checked checkbox '{fid or fname}'")
+                    else:
+                        current = (el.get_attribute("value") or "").strip()
+                        if not current:
+                            self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                            try:
+                                el.click()
+                            except Exception:
+                                pass
+                            try:
+                                self.driver.execute_script(_NATIVE_SET_VALUE_JS, el, "")
+                            except Exception:
+                                pass
+                            try:
+                                el.send_keys(Keys.CONTROL + "a")
+                                el.send_keys(Keys.BACKSPACE)
+                            except Exception:
+                                pass
+                            el.send_keys(str(val))
+                            final_value = (el.get_attribute("value") or "").strip()
+                            if final_value != str(val).strip():
+                                try:
+                                    self.driver.execute_script(_NATIVE_SET_VALUE_JS, el, str(val))
+                                except Exception:
+                                    pass
+                            print(f"  [OK] LLM-filled field '{fid or fname}' -> '{str(val)[:40]}'")
+                    continue
+
+                # Radio group: no single element id — find the option matching the answer text.
+                if fname:
+                    radios = self.driver.find_elements(By.CSS_SELECTOR, f"input[type='radio'][name='{fname}']")
+                    for r in radios:
+                        rid = r.get_attribute("id") or ""
+                        label = ""
+                        if rid:
+                            try:
+                                label = self.driver.find_element(By.CSS_SELECTOR, f"label[for='{rid}']").text.strip()
+                            except Exception:
+                                pass
+                        label = label or r.get_attribute("value") or ""
+                        if label.strip().lower() == val.strip().lower() and not r.is_selected():
+                            self.driver.execute_script("arguments[0].click();", r)
+                            print(f"  [OK] LLM-selected radio '{fname}' -> '{val}'")
+                            break
+            except Exception:
+                pass
+
+    def _page_signature(self):
+        try:
+            return self.driver.find_element(By.TAG_NAME, "body").text[:3000]
+        except Exception:
+            return ""
+
+    def _is_final_submit_step(self):
+        """True if a final Submit/Apply button (not Next/Continue) is visible on the current step."""
+        try:
+            selectors = [
+                "xpath://button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit')]",
+                "xpath://button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'apply now')]",
+                "button[type='submit']",
+                "input[type='submit']",
+            ]
+            for sel in selectors:
+                by_type = By.XPATH if sel.startswith("xpath:") else By.CSS_SELECTOR
+                actual_sel = sel[6:] if sel.startswith("xpath:") else sel
+                for el in self.driver.find_elements(by_type, actual_sel):
+                    if el.is_displayed() and el.is_enabled():
+                        text = (el.text or el.get_attribute("value") or "").strip().lower()
+                        if "next" in text or "continue" in text:
+                            continue
+                        if any(k in text for k in ("submit", "send application", "apply now")):
+                            return True
+        except Exception:
+            pass
+        return False
+
+    def _click_continue_button(self):
+        """Click a Next/Continue/Save & Continue button to advance a multi-step form. Never clicks a Submit button."""
+        continue_selectors = [
+            "xpath://button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'continue')]",
+            "xpath://button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'next')]",
+            "xpath://a[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'continue')]",
+            "button[type='submit']",
+        ]
+        for sel in continue_selectors:
+            try:
+                by_type = By.XPATH if sel.startswith("xpath:") else By.CSS_SELECTOR
+                actual_sel = sel[6:] if sel.startswith("xpath:") else sel
+                elements = self.driver.find_elements(by_type, actual_sel)
+                for el in elements:
+                    if not (el.is_displayed() and el.is_enabled()):
+                        continue
+                    text = (el.text or el.get_attribute("value") or "").strip().lower()
+                    if "submit" in text and "continue" not in text and "next" not in text:
+                        continue
+                    self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                    time.sleep(0.2)
+                    try:
+                        el.click()
+                    except Exception:
+                        self.driver.execute_script("arguments[0].click();", el)
+                    print(f"  [OK] Clicked continue/next: '{text}'")
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def fill_form(self, tailored_cv, cover_letter, cv_filepath=None, job_id=None):
+        """
+        Fill an external application form. Handles multi-step wizards (e.g. Lensa,
+        Workday, Greenhouse) by looping: fill whatever is visible on the current
+        step, then click Continue/Next and repeat, until a final Submit step is
+        reached (left for the human to review and submit) or the form gets stuck.
+        """
+        try:
             self._click_initial_apply_button()
 
-            full_name = tailored_cv.get("full_name", "")
-            email = tailored_cv.get("email", "") or CANDIDATE_EMAIL
-            phone = tailored_cv.get("phone", "")
-            location = tailored_cv.get("location", "")
-            summary = tailored_cv.get("summary", "")
+            max_steps = 6
+            stuck_count = 0
 
-            name_parts = full_name.split() if full_name else []
-            first_name = name_parts[0] if name_parts else ""
-            last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
+            for step in range(max_steps):
+                self._fill_identity_and_links(tailored_cv)
 
-            # 1. Resume File Upload
-            if cv_filepath and os.path.exists(cv_filepath):
-                print(f"  Attempting file upload of: {cv_filepath}")
-                self._try_upload_file(cv_filepath)
-                time.sleep(1.5)
+                if cv_filepath and os.path.exists(cv_filepath):
+                    self._try_upload_file(cv_filepath, kind="resume")
 
-            # 2. Identity fields
-            self._try_fill_any([
-                "input[name*='full_name' i]", "input[id*='full_name' i]",
-                "input[name*='fullname' i]", "input[id*='fullname' i]",
-                "input[name*='display_name' i]", "input[id*='display_name' i]",
-                "input[name*='name' i][name*='full' i]",
-                "input[placeholder*='full name' i]",
-            ], full_name)
+                uploaded_cl_file = False
+                if cover_letter and job_id:
+                    cl_path = _generate_cover_letter_text_file(cover_letter, job_id)
+                    uploaded_cl_file = self._try_upload_file(cl_path, kind="cover_letter")
+                if cover_letter and not uploaded_cl_file:
+                    self._try_fill_any([
+                        "textarea[name*='cover' i]", "textarea[id*='cover' i]",
+                        "textarea[name*='letter' i]", "textarea[id*='letter' i]",
+                        "textarea[name*='motivation' i]", "textarea[id*='motivation' i]",
+                        "textarea[placeholder*='cover letter' i]",
+                    ], cover_letter)
 
-            self._try_fill_any([
-                "input[name*='first_name' i]", "input[id*='first_name' i]",
-                "input[name*='firstname' i]", "input[id*='firstname' i]",
-                "input[name*='given' i]", "input[id*='given' i]",
-                "input[placeholder*='first name' i]",
-            ], first_name)
+                self._click_consent_checkboxes()
+                self._fill_known_dropdowns()
 
-            self._try_fill_any([
-                "input[name*='last_name' i]", "input[id*='last_name' i]",
-                "input[name*='lastname' i]", "input[id*='lastname' i]",
-                "input[name*='surname' i]", "input[id*='surname' i]",
-                "input[name*='family' i]", "input[id*='family' i]",
-                "input[placeholder*='last name' i]",
-            ], last_name)
+                page_text = self._page_signature()
+                remaining_fields = self._collect_unfilled_fields()
+                if remaining_fields:
+                    answers = self._llm_answer_fields(tailored_cv, remaining_fields, page_text)
+                    if answers:
+                        self._apply_llm_field_answers(answers)
+                        print(f"  [OK] LLM answered {len(answers)} additional field(s)")
 
-            self._try_fill_any([
-                "input[type='email']",
-                "input[name*='email' i]", "input[id*='email' i]",
-                "input[placeholder*='email' i]",
-            ], email)
+                if self._is_final_submit_step():
+                    print("  [OK] Form fully filled — reached final submit step. Waiting for your review/submission.")
+                    return True
 
-            if phone:
-                self._try_fill_any([
-                    "input[type='tel']",
-                    "input[name*='phone' i]", "input[id*='phone' i]",
-                    "input[name*='mobile' i]", "input[id*='mobile' i]",
-                    "input[name*='telephone' i]", "input[id*='telephone' i]",
-                    "input[placeholder*='phone' i]",
-                ], phone)
+                text_before = self._page_signature()
+                clicked = self._click_continue_button()
+                if not clicked:
+                    print("  [OK] No further Continue/Next button found — treating current step as final.")
+                    return True
 
-            if location:
-                self._try_fill_any([
-                    "input[name*='location' i]", "input[id*='location' i]",
-                    "input[name*='city' i]", "input[id*='city' i]",
-                    "input[name*='address' i]", "input[id*='address' i]",
-                    "input[placeholder*='city' i]",
-                ], location)
+                time.sleep(1.8)
+                self.wait_for_cloudflare()
 
-            # 3. Web links
-            links = tailored_cv.get('links', [])
-            if isinstance(links, list):
-                for link in links:
-                    l_lower = link.lower()
-                    if 'linkedin' in l_lower:
-                        self._try_fill_any([
-                            "input[name*='linkedin' i]", "input[id*='linkedin' i]",
-                            "input[placeholder*='linkedin' i]",
-                            "input[name*='link' i][name*='in' i]",
-                        ], link)
-                    elif 'github' in l_lower:
-                        self._try_fill_any([
-                            "input[name*='github' i]", "input[id*='github' i]",
-                            "input[placeholder*='github' i]",
-                            "input[name*='git' i]",
-                        ], link)
-                    elif 'portfolio' in l_lower or 'website' in l_lower:
-                        self._try_fill_any([
-                            "input[name*='portfolio' i]", "input[id*='portfolio' i]",
-                            "input[name*='website' i]", "input[id*='website' i]",
-                            "input[placeholder*='website' i]",
-                            "input[placeholder*='portfolio' i]",
-                            "input[name*='personal' i][name*='site' i]",
-                        ], link)
+                if self._page_signature() == text_before:
+                    stuck_count += 1
+                else:
+                    stuck_count = 0
 
-            # 4. Cover Letter & Summary textareas
-            if summary:
-                self._try_fill_any([
-                    "textarea[name*='summary' i]", "textarea[id*='summary' i]",
-                    "textarea[name*='about' i]", "textarea[id*='about' i]",
-                    "textarea[placeholder*='summary' i]",
-                ], summary)
+                if stuck_count >= 2:
+                    print("  [WARN] Continue click had no visible effect after repeated attempts — leaving form for manual completion.")
+                    return True
 
-            if cover_letter:
-                self._try_fill_any([
-                    "textarea[name*='cover' i]", "textarea[id*='cover' i]",
-                    "textarea[name*='letter' i]", "textarea[id*='letter' i]",
-                    "textarea[name*='motivation' i]", "textarea[id*='motivation' i]",
-                    "textarea[placeholder*='cover letter' i]",
-                ], cover_letter)
-
-            # 5. Autoclick general consent checkboxes
-            try:
-                consent_selectors = [
-                    "input[type='checkbox'][name*='privacy' i]",
-                    "input[type='checkbox'][name*='consent' i]",
-                    "input[type='checkbox'][name*='terms' i]",
-                    "input[type='checkbox'][id*='privacy' i]",
-                    "input[type='checkbox'][id*='consent' i]",
-                    "input[type='checkbox'][id*='agree' i]",
-                    "input[type='checkbox'][value*='agree' i]",
-                ]
-                for sel in consent_selectors:
-                    for el in self.driver.find_elements(By.CSS_SELECTOR, sel):
-                        if el.is_displayed() and not el.is_selected():
-                            self.driver.execute_script("arguments[0].click();", el)
-                            print(f"  [OK] Clicked consent checkbox: {sel}")
-            except Exception as ce:
-                print(f"  [WARN] Checkbox clicking error: {ce}")
-
-            # 6. Auto-resolving dropdown select questions (Sponsorship, Auth)
-            try:
-                select_elements = self.driver.find_elements(By.CSS_SELECTOR, "select")
-                for sel in select_elements:
-                    if not sel.is_displayed():
-                        continue
-                    aria = (sel.get_attribute("aria-label") or "").lower()
-                    name = (sel.get_attribute("name") or "").lower()
-                    text_content = (sel.text or "").lower()
-                    
-                    is_sponsorship = any(k in aria or k in name or k in text_content for k in ("sponsor", "visa", "sponsorship"))
-                    is_auth = any(k in aria or k in name or k in text_content for k in ("authorized", "legally", "permit"))
-
-                    from selenium.webdriver.support.ui import Select as SelObject
-                    sel_obj = SelObject(sel)
-                    
-                    if is_sponsorship:
-                        # Auto select "No" to sponsorship questions
-                        for opt in sel_obj.options:
-                            opt_text = (opt.text or "").lower()
-                            if opt_text.strip() in ("no", "false", "n"):
-                                sel_obj.select_by_visible_text(opt.text)
-                                print(f"  [OK] Sponsorship dropdown auto-filled: {opt.text}")
-                                break
-                    elif is_auth:
-                        # Auto select "Yes" to work authorization questions
-                        for opt in sel_obj.options:
-                            opt_text = (opt.text or "").lower()
-                            if opt_text.strip() in ("yes", "true", "y"):
-                                sel_obj.select_by_visible_text(opt.text)
-                                print(f"  [OK] Work Auth dropdown auto-filled: {opt.text}")
-                                break
-            except Exception as se:
-                print(f"  [WARN] Dropdown auto-filling error: {se}")
-
-            print("  [OK] Form auto-fill completed")
+            print("  [WARN] Reached max auto-fill steps — leaving form for manual completion/review.")
             return True
         except Exception as e:
             print(f"Error during auto-fill: {e}")
@@ -579,8 +947,15 @@ class SequentialApplier:
         job_url = job.get('url') or job.get('job_url')
         job_source = (job.get('source') or '').lower()
 
+        # The 180s countdown starts the instant this job begins processing — i.e. the
+        # moment "Apply for this job" is clicked — and covers the bot's own fill-in
+        # work as well as the human review window as one continuous budget. This is
+        # what the dashboard's countdown bar reads via /apply/status the whole time.
+        review_deadline_epoch["value"] = time.time() + REVIEW_TIMEOUT_SECONDS
+
         if not job_url:
             log_application(job_id, job_title, company, JobStatus.FAILED, "Missing application URL")
+            review_deadline_epoch["value"] = None
             return False
 
         try:
@@ -642,9 +1017,10 @@ class SequentialApplier:
                         print("  No new tab detected, continuing in current tab.")
                     
                     self.wait_for_cloudflare()
-                    self.fill_form(tailored_cv, cover_letter, cv_filepath)
+                    self.fill_form(tailored_cv, cover_letter, cv_filepath, job_id=job_id)
                 elif result == 'already_applied':
                     log_application(job_id, job_title, company, JobStatus.SUBMITTED, "Already applied via LinkedIn")
+                    review_deadline_epoch["value"] = None
                     return True
                 elif result == 'failed':
                     print(f"[LinkedIn Agent] Could not complete — leaving browser open for manual apply")
@@ -670,7 +1046,7 @@ class SequentialApplier:
                         print("  No new tab detected, continuing in current tab.")
                     
                     self.wait_for_cloudflare()
-                    self.fill_form(tailored_cv, cover_letter, cv_filepath)
+                    self.fill_form(tailored_cv, cover_letter, cv_filepath, job_id=job_id)
                 elif result == 'failed':
                     print(f"[Indeed Agent] Could not reach review page — leaving for human review")
 
@@ -678,7 +1054,7 @@ class SequentialApplier:
                 # Generic path: open URL and fill form directly
                 print(f"[Generic Filler] Filling form for: {job_title} at {company}")
                 self.wait_for_cloudflare()
-                self.fill_form(tailored_cv, cover_letter, cv_filepath)
+                self.fill_form(tailored_cv, cover_letter, cv_filepath, job_id=job_id)
 
             log_application(job_id, job_title, company, JobStatus.READY)
 
@@ -689,11 +1065,16 @@ class SequentialApplier:
             review_event.clear()
             skip_event.clear()
 
-            # Wait for human signal or auto-detect
+            timed_out = False
+
+            # Wait for human signal, auto-detect, or the review timeout
             while not review_event.is_set() and not skip_event.is_set():
+                if time.time() >= review_deadline_epoch["value"]:
+                    timed_out = True
+                    break
                 try:
                     current_url = self.driver.current_url.lower()
-                    
+
                     # 1. Check for expired linkedin job
                     if 'linkedin.com' in current_url:
                         try:
@@ -701,6 +1082,7 @@ class SequentialApplier:
                             if body_el and "no longer accepting applications" in body_el.text.lower():
                                 print(f"LinkedIn job expired for: {job_title}")
                                 log_application(job_id, job_title, company, JobStatus.EXPIRED, "No longer accepting applications")
+                                review_deadline_epoch["value"] = None
                                 try:
                                     self.driver.close()
                                     if self.driver.window_handles:
@@ -710,10 +1092,10 @@ class SequentialApplier:
                                 return False
                         except Exception:
                             pass
-                            
+
                     # 2. Check for manual submission detection
                     is_submitted = False
-                    
+
                     # URL change detection
                     if any(word in current_url for word in ['success', 'thank', 'completed', 'submitted', 'post-apply']):
                         is_submitted = True
@@ -740,23 +1122,36 @@ class SequentialApplier:
                                 is_submitted = True
                         except Exception:
                             pass
-                            
+
                     if is_submitted:
                         print(f"Auto-detected submission for: {job_title}")
                         review_event.set()
                         break
-                        
+
                     # Standard check to ensure browser is still open
                     self.driver.title
                 except Exception as e:
                     print(f"Browser closed for: {job_title}")
                     log_application(job_id, job_title, company, JobStatus.TAILORED, "User closed browser before submit")
+                    review_deadline_epoch["value"] = None
                     return False
                 time.sleep(1.5)
 
+            review_deadline_epoch["value"] = None
+
+            if timed_out:
+                print(f"Review timed out after {REVIEW_TIMEOUT_SECONDS}s without submission: {job_title}")
+                log_application(job_id, job_title, company, JobStatus.TAILORED, f"Timed out after {REVIEW_TIMEOUT_SECONDS}s without submission")
+                try:
+                    self.driver.quit()
+                except Exception:
+                    pass
+                self.driver = None
+                return False
+
             if skip_event.is_set():
                 print(f"Skipped: {job_title}")
-                log_application(job_id, job_title, company, JobStatus.TAILORED, "User skipped during review")
+                log_application(job_id, job_title, company, JobStatus.SKIPPED, "User skipped during review")
                 # Clean up secondary window handles and return to primary
                 try:
                     current_handle = self.driver.current_window_handle
@@ -786,6 +1181,7 @@ class SequentialApplier:
         except Exception as e:
             print(f"Failed to apply to {job_title}: {e}")
             log_application(job_id, job_title, company, JobStatus.FAILED, str(e))
+            review_deadline_epoch["value"] = None
             return False
 
     def close(self):

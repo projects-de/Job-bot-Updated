@@ -1,7 +1,7 @@
 import hashlib
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 
 from apify_client import ApifyClient
@@ -71,7 +71,7 @@ def fetch_linkedin_jobs_via_apify_api(options: Optional[Dict] = None) -> List[Di
         run_input = {
             "searchQuery": options.get("searchQuery", config.JOB_KEYWORDS),
             "location": options.get("location", config.JOB_LOCATION),
-            "maxJobs": options.get("maxJobs", 999),
+            "maxJobs": options.get("maxJobs", 50),
             "workplaceType": options.get("workplaceType", "2"),  # Remote
             "datePosted": options.get("datePosted", "r86400"),  # Last 24 hours
             "sortBy": options.get("sortBy", "R"),              # Most recent
@@ -86,15 +86,16 @@ def fetch_linkedin_jobs_via_apify_api(options: Optional[Dict] = None) -> List[Di
 
         run = client.actor(LINKEDIN_ACTOR_ID).call(
             run_input=run_input,
-            timeout_secs=config.APIFY_TIMEOUT_SECONDS,
+            run_timeout=timedelta(seconds=config.APIFY_TIMEOUT_SECONDS),
             memory_mbytes=256,
         )
 
         jobs = []
-        if run and run.get("defaultDatasetId"):
-            log(f"Actor run completed. Dataset ID: {run['defaultDatasetId']}")
-            dataset_items = client.dataset(run["defaultDatasetId"]).list_items().items
-            
+        dataset_id = getattr(run, "default_dataset_id", None) or (run.get("defaultDatasetId") if isinstance(run, dict) else None)
+        if run and dataset_id:
+            log(f"Actor run completed. Dataset ID: {dataset_id}")
+            dataset_items = client.dataset(dataset_id).list_items().items
+
             for item in dataset_items:
                 jobs.append(normalize_linkedin_job(item))
         else:

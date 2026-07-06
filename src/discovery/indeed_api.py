@@ -1,6 +1,6 @@
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 
 from apify_client import ApifyClient
@@ -80,7 +80,7 @@ def fetch_indeed_jobs_via_apify_api(options: Optional[Dict] = None) -> List[Dict
             "location": options.get("location", config.JOB_LOCATION),
             "country": options.get("country", "us"),
             "datePosted": options.get("datePosted", "1"), # Last 24 hours (Indeed internal value)
-            "limit": options.get("limit", 999),
+            "limit": options.get("limit", 50),
         }
 
         log(f"Starting Indeed Apify actor ({INDEED_ACTOR_ID}) with input:")
@@ -88,14 +88,15 @@ def fetch_indeed_jobs_via_apify_api(options: Optional[Dict] = None) -> List[Dict
 
         run = client.actor(INDEED_ACTOR_ID).call(
             run_input=run_input,
-            timeout_secs=config.APIFY_TIMEOUT_SECONDS,
+            run_timeout=timedelta(seconds=config.APIFY_TIMEOUT_SECONDS),
         )
 
         jobs = []
-        if run and run.get("defaultDatasetId"):
-            log(f"Indeed Actor run completed. Dataset ID: {run['defaultDatasetId']}")
-            dataset_items = client.dataset(run["defaultDatasetId"]).list_items().items
-            
+        dataset_id = getattr(run, "default_dataset_id", None) or (run.get("defaultDatasetId") if isinstance(run, dict) else None)
+        if run and dataset_id:
+            log(f"Indeed Actor run completed. Dataset ID: {dataset_id}")
+            dataset_items = client.dataset(dataset_id).list_items().items
+
             for item in dataset_items:
                 jobs.append(normalize_indeed_job(item))
         else:

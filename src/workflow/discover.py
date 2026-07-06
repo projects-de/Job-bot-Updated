@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -10,19 +11,34 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")
 from src import config
 from src.discovery.linkedin_api import fetch_linkedin_jobs_via_apify_api
 from src.discovery.indeed_api import fetch_indeed_jobs_via_apify_api
-from src.discovery.dice_api import fetch_dice_jobs_via_apify_api
 from src.storage.tracker import save_jobs, save_summary
 from src.utils.logger import error, log
 
 
 def canonical_job_url(url):
+    """
+    Normalize a job URL for duplicate detection. Keeps the query string —
+    Indeed's job ID lives entirely in `?jk=...`, so stripping it (as a naive
+    "drop tracking params" pass would) collapses nearly all distinct Indeed
+    postings onto the same bare path. Only the fragment is dropped, since
+    that's never load-bearing for identifying a specific job posting.
+    """
     if not url:
         return ""
     parsed = urlsplit(url)
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, parsed.query, ""))
+
+
+# Preference order when the same role is posted on multiple sources — lower wins.
+SOURCE_PRIORITY = {"linkedin": 0, "indeed": 1}
+
+
+def _normalize_for_match(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
 
 
 def deduplicate_jobs(jobs):
+    # Pass 1: drop exact duplicate postings (same canonical URL, or same source+title+company).
     seen = set()
     deduped = []
     for job in jobs:
@@ -34,7 +50,35 @@ def deduplicate_jobs(jobs):
 
         seen.add(key)
         deduped.append(job)
-    return deduped
+
+    # Pass 2: the same role posted on multiple sources -> keep only the preferred source
+    # (LinkedIn over Indeed), matched by normalized title + company. Groups made up of a
+    # single source are left untouched — a platform can legitimately have several distinct
+    # postings that share a title + company (different teams/req IDs), and that's not a
+    # cross-platform duplicate. Only genuine multi-source groups get collapsed, and their
+    # survivors are flagged cross_platform_match=True (the "Unique Jobs" card/tab).
+    groups = {}
+    for job in deduped:
+        role_key = (_normalize_for_match(job.get("job_title")), _normalize_for_match(job.get("company")))
+        groups.setdefault(role_key, []).append(job)
+
+    result = []
+    for group in groups.values():
+        sources_in_group = {(j.get("source") or "").lower() for j in group}
+        if len(sources_in_group) <= 1:
+            for j in group:
+                j = dict(j)
+                j["cross_platform_match"] = False
+                result.append(j)
+            continue
+
+        best_priority = min(SOURCE_PRIORITY.get(s, 99) for s in sources_in_group)
+        for j in group:
+            if SOURCE_PRIORITY.get((j.get("source") or "").lower(), 99) == best_priority:
+                j = dict(j)
+                j["cross_platform_match"] = True
+                result.append(j)
+    return result
 
 
 def is_strict_data_engineer(job: dict) -> bool:
@@ -83,14 +127,12 @@ def run_discovery():
         source_jobs = {
             "LinkedIn": [],
             "Indeed": [],
-            "Dice": [],
         }
         errors = []
 
         fetchers = {
             "LinkedIn": fetch_linkedin_jobs_via_apify_api,
             "Indeed": fetch_indeed_jobs_via_apify_api,
-            "Dice": fetch_dice_jobs_via_apify_api,
         }
 
         with ThreadPoolExecutor(max_workers=len(fetchers)) as executor:
@@ -124,17 +166,18 @@ def run_discovery():
                     errors.append(message)
                     error(message)
 
-        all_jobs = source_jobs["LinkedIn"] + source_jobs["Indeed"] + source_jobs["Dice"]
+        all_jobs = source_jobs["LinkedIn"] + source_jobs["Indeed"]
         deduped_jobs = deduplicate_jobs(all_jobs)
+        cross_platform_count = sum(1 for j in deduped_jobs if j.get("cross_platform_match"))
 
         summary = {
             "date": datetime.utcnow().isoformat(),
             "total_discovered": len(all_jobs),
             "total_deduplicated": len(deduped_jobs),
+            "cross_platform_duplicates": cross_platform_count,
             "by_source": {
                 "LinkedIn": len(source_jobs["LinkedIn"]),
                 "Indeed": len(source_jobs["Indeed"]),
-                "Dice": len(source_jobs["Dice"]),
             },
             "errors": errors,
         }
@@ -146,10 +189,9 @@ def run_discovery():
 
         log("=== Daily discovery workflow complete ===")
         log(
-            "LinkedIn: {linkedin}, Indeed: {indeed}, Dice: {dice}".format(
+            "LinkedIn: {linkedin}, Indeed: {indeed}".format(
                 linkedin=len(source_jobs["LinkedIn"]),
                 indeed=len(source_jobs["Indeed"]),
-                dice=len(source_jobs["Dice"]),
             )
         )
         log(f"Total Unique Strict Data Engineer Jobs: {len(deduped_jobs)}")

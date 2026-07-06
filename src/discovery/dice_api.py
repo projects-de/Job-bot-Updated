@@ -1,7 +1,7 @@
 import hashlib
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 
 from apify_client import ApifyClient
@@ -75,7 +75,7 @@ def fetch_dice_jobs_via_apify_api(options: Optional[Dict] = None) -> List[Dict]:
 
         run = client.actor(config.DICE_ACTOR_ID).call(
             run_input=run_input,
-            timeout_secs=config.APIFY_TIMEOUT_SECONDS,
+            run_timeout=timedelta(seconds=config.APIFY_TIMEOUT_SECONDS),
         )
 
         jobs = []

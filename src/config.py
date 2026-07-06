@@ -46,6 +46,11 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 DICE_ACTOR_ID = os.getenv("DICE_ACTOR_ID", "lexis-solutions/dice-com-jobs-scraper")
 
+# Daily job report email (sent once per day at 12:00 AM Pakistan Standard Time)
+REPORT_SMTP_EMAIL = os.getenv("REPORT_SMTP_EMAIL")
+REPORT_SMTP_APP_PASSWORD = os.getenv("REPORT_SMTP_APP_PASSWORD")
+REPORT_RECIPIENT_EMAIL = os.getenv("REPORT_RECIPIENT_EMAIL")
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"

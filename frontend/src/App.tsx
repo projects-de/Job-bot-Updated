@@ -35,17 +35,21 @@ interface Job {
   description: string;
   status: string;
   salary?: string;
+  cross_platform_match?: boolean;
 }
 
 interface Summary {
   total_discovered: number;
   total_deduplicated: number;
+  cross_platform_duplicates?: number;
   by_source: Record<string, number>;
   last_scan_time?: string;
   groq_api_usage?: number;
   tailored?: number;
   ready?: number;
   submitted?: number;
+  skipped?: number;
+  expired?: number;
 }
 
 interface AppStatus {
@@ -54,6 +58,8 @@ interface AppStatus {
   current_idx?: number;
   total?: number;
   error?: string;
+  seconds_remaining?: number;
+  review_timeout_seconds?: number;
 }
 
 interface DiscoveryLogs {
@@ -93,7 +99,7 @@ const App: React.FC = () => {
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   const [isGeneratingPreview, setIsGeneratingPreview] = useState(false);
   const [activeTab, setActiveTab] = useState<Tab>('overview');
-  const [overviewMode, setOverviewMode] = useState<'all' | 'unique' | 'pipeline'>('unique');
+  const [overviewMode, setOverviewMode] = useState<'all' | 'unique' | 'crossmatch' | 'pipeline'>('unique');
   const [waitingForReviewCompletion, setWaitingForReviewCompletion] = useState(false);
   const [expandedAppliedJobId, setExpandedAppliedJobId] = useState<string | null>(null);
   const [cvVersion, setCvVersion] = useState(0);
@@ -192,15 +198,20 @@ const App: React.FC = () => {
     }
   }, [appStatus.running, appStatus.current_job?.id]);
 
+  const prevAppRunningRef = React.useRef(false);
   useEffect(() => {
-    if (waitingForReviewCompletion && !appStatus.running) {
+    // Fires on the falling edge of appStatus.running — covers all three
+    // terminal outcomes (human submit, human skip, auto-detected expiry)
+    // plus failures, regardless of whether a dashboard button was clicked.
+    if (prevAppRunningRef.current && !appStatus.running) {
       setWaitingForReviewCompletion(false);
       setSelectedJobId(null);
       setTailoredPreview(null);
       setActiveTab('overview');
       fetchData();
     }
-  }, [waitingForReviewCompletion, appStatus.running]);
+    prevAppRunningRef.current = appStatus.running;
+  }, [appStatus.running]);
 
   useEffect(() => {
     const loadTailoredForSelected = async () => {
@@ -228,10 +239,17 @@ const App: React.FC = () => {
 
   const overviewJobs = useMemo(() => {
     let filtered = (overviewMode === 'all' ? allJobs : jobs);
-    
+
     if (overviewMode === 'pipeline') {
-      // In pipeline mode, show jobs that are tailored or ready but not yet submitted
-      filtered = allJobs.filter(j => j.status === 'tailored' || j.status === 'ready');
+      // In pipeline mode, show jobs that are tailored, ready, or skipped (a skipped job was
+      // still tailored — it just wasn't submitted — so it belongs in this list too).
+      filtered = allJobs.filter((j) => ['tailored', 'ready', 'skipped'].includes((j.status || '').toLowerCase()));
+    } else if (overviewMode === 'crossmatch') {
+      // Jobs found on both LinkedIn and Indeed — the "Unique Jobs" card's own list.
+      filtered = jobs.filter((j) => j.cross_platform_match && !['submitted', 'expired', 'skipped'].includes((j.status || '').toLowerCase()));
+    } else {
+      // Terminal outcomes belong in the Applied Jobs tab, not the active list.
+      filtered = filtered.filter((j) => !['submitted', 'expired', 'skipped'].includes((j.status || '').toLowerCase()));
     }
 
     return filtered.filter((job) =>
@@ -715,15 +733,14 @@ const App: React.FC = () => {
                 <div className="source-breakdown mt-2 text-sm text-muted">
                   <div className="flex justify-between"><span>LinkedIn:</span> <span>{summary?.by_source?.LinkedIn || summary?.by_source?.linkedin || 0}</span></div>
                   <div className="flex justify-between"><span>Indeed:</span> <span>{summary?.by_source?.Indeed || summary?.by_source?.indeed || 0}</span></div>
-                  <div className="flex justify-between"><span>Dice:</span> <span>{summary?.by_source?.Dice || summary?.by_source?.dice || 0}</span></div>
                 </div>
               </div>
 
-              <div className={`stat-card border-success-subtle cursor-pointer ${overviewMode === 'unique' ? 'active-unique' : ''}`} onClick={() => setOverviewMode('unique')}>
+              <div className={`stat-card border-success-subtle cursor-pointer ${overviewMode === 'crossmatch' ? 'active-unique' : ''}`} onClick={() => setOverviewMode('crossmatch')}>
                 <div className="stat-label">Unique Jobs</div>
-                <div className="stat-value text-success">{summary?.total_deduplicated || 0}</div>
+                <div className="stat-value text-success">{summary?.cross_platform_duplicates || 0}</div>
                 <div className="source-breakdown mt-2 text-sm text-muted">
-                  <p>Duplicates automatically removed</p>
+                  <p>Posted on both LinkedIn &amp; Indeed</p>
                 </div>
               </div>
 
@@ -741,14 +758,17 @@ const App: React.FC = () => {
               <div className="overview-jobs-header">
                 <div>
                   <h3>
-                    {overviewMode === 'all' ? 'All Discovered Jobs' : 
-                     overviewMode === 'unique' ? 'Unique Jobs' : 'Tailored Pipeline'}
+                    {overviewMode === 'all' ? 'All Discovered Jobs' :
+                     overviewMode === 'crossmatch' ? 'Jobs Posted on Both Platforms' :
+                     overviewMode === 'unique' ? 'Available Jobs' : 'Tailored Pipeline'}
                   </h3>
                   <p>
                     {overviewMode === 'all'
                       ? 'Showing every discovered role from the latest scan.'
+                      : overviewMode === 'crossmatch'
+                      ? 'Roles found on both LinkedIn and Indeed — shown once here as their LinkedIn listing.'
                       : overviewMode === 'unique'
-                      ? 'Showing the deduplicated set after duplicate removal.'
+                      ? 'Showing the deduplicated set — total scraped minus cross-platform duplicates.'
                       : 'Showing jobs that are tailored and ready for application.'}
                   </p>
                 </div>
@@ -757,7 +777,7 @@ const App: React.FC = () => {
 
               <div className="job-cards-grid overview-job-grid">
                 <AnimatePresence>
-                  {overviewJobs.filter((j) => j.status !== 'submitted').map((job, index) => renderJobCard(job, index))}
+                  {overviewJobs.map((job, index) => renderJobCard(job, index))}
                 </AnimatePresence>
               </div>
             </div>
@@ -767,18 +787,19 @@ const App: React.FC = () => {
 
         {activeTab === 'applied' && (
           <div className="tab-pane applied-pane">
-            <h2 className="mb-4">Applied & Expired Jobs</h2>
+            <h2 className="mb-4">Applied, Skipped &amp; Expired Jobs</h2>
             <div className="applied-jobs-list">
               {appliedJobs.length === 0 ? (
                 <div className="empty-state">
-                  <p>No submitted or expired jobs yet.</p>
+                  <p>No submitted, skipped, or expired jobs yet.</p>
                 </div>
               ) : (
                 appliedJobs.map((job) => {
                   const expanded = expandedAppliedJobId === job.job_id;
                   const isExpired = job.status === 'EXPIRED';
+                  const isSkipped = job.status === 'SKIPPED';
                   return (
-                    <div className={`applied-job-card ${isExpired ? 'border-danger-subtle' : ''}`} key={job.job_id}>
+                    <div className={`applied-job-card ${isExpired ? 'border-danger-subtle' : ''} ${isSkipped ? 'border-warning-subtle' : ''}`} key={job.job_id}>
                       <div className="applied-job-top">
                         <div>
                           <h4 className="job-title">{job.job_title}</h4>
@@ -788,6 +809,8 @@ const App: React.FC = () => {
                             {job.location && <span><MapPin size={14} /> {job.location}</span>}
                             {isExpired ? (
                               <span className="text-danger"><CheckCircle size={14} /> Expired: {job.submitted_at || 'Unknown'}</span>
+                            ) : isSkipped ? (
+                              <span className="text-warning"><SkipForward size={14} /> Skipped: {job.submitted_at || 'Unknown'}</span>
                             ) : (
                               job.submitted_at && <span className="text-success"><CheckCircle size={14} /> Submitted: {job.submitted_at}</span>
                             )}
@@ -992,6 +1015,21 @@ const App: React.FC = () => {
                             <p>Review the browser form, make adjustments, and submit. Then click below.</p>
                           </div>
                         </div>
+                        {typeof appStatus.seconds_remaining === 'number' && (
+                          <div className="review-countdown">
+                            <div className="review-countdown-track">
+                              <div
+                                className="review-countdown-fill"
+                                style={{
+                                  width: `${Math.max(0, Math.min(100, (appStatus.seconds_remaining / (appStatus.review_timeout_seconds || 180)) * 100))}%`,
+                                }}
+                              />
+                            </div>
+                            <span className="review-countdown-label">
+                              {Math.floor(appStatus.seconds_remaining / 60)}:{String(appStatus.seconds_remaining % 60).padStart(2, '0')} left to submit
+                            </span>
+                          </div>
+                        )}
                         <div className="flex gap-2">
                           <button className="btn btn-outline text-danger border-danger" onClick={handleSkipApplication}><SkipForward size={18} /> Skip</button>
                           <button className="btn btn-success" onClick={handleReviewComplete}><CheckCircle size={18} /> Submit Done</button>
