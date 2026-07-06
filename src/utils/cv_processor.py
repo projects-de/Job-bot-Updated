@@ -4,6 +4,7 @@ import PyPDF2
 from docx import Document
 from groq import Groq
 from src.config import GROQ_API_KEY
+from src.utils.groq_retry import retry_groq_call
 
 def extract_text_from_pdf(pdf_path):
     text = ""
@@ -52,12 +53,12 @@ def parse_cv_with_ai(cv_text):
     {cv_text}
     """
     
-    response = client.chat.completions.create(
+    response = retry_groq_call(lambda: client.chat.completions.create(
         messages=[{"role": "user", "content": prompt}],
         model="llama-3.3-70b-versatile",
         temperature=0.1,
-    )
-    
+    ))
+
     try:
         text = response.choices[0].message.content.strip()
         # Handle cases where model adds text before/after JSON

@@ -16,58 +16,60 @@ def stable_job_id(prefix: str, value: str) -> str:
 
 def normalize_dice_job(item: Dict) -> Dict:
     """
-    Normalize a raw Dice job item from the Apify dataset
-    into the shared Job-Bot schema.
+    Normalize a raw Dice job item from the "shahidirfan/Dice-Job-Scraper" Apify
+    actor's dataset into the shared Job-Bot schema.
     """
     title = item.get("title") or ""
     location = item.get("location") or ""
-    
-    # Generic remote detection if not explicitly provided
+    work_setting = (item.get("workSetting") or "").lower()
+
     is_remote = (
-        bool(re.search(r"remote", title, re.IGNORECASE)) or 
-        bool(re.search(r"remote", location, re.IGNORECASE)) or
-        item.get("isRemote", False)
+        "remote" in work_setting or
+        bool(re.search(r"remote", title, re.IGNORECASE)) or
+        bool(re.search(r"remote", location, re.IGNORECASE))
     )
+
+    description = item.get("description_text") or item.get("summary") or ""
+    description_html = item.get("description_html") or ""
+
+    url = item.get("url") or item.get("detailsPageUrl") or ""
+    raw_id = item.get("dice_id") or item.get("jobId") or item.get("id") or item.get("guid") or url or title
 
     return {
         "source": "Dice",
-        "job_title": item.get("title", "Data Engineering"),
-        "company": item.get("companyName", item.get("company", "Unknown")),
-        "company_url": item.get("companyUrl"),
-        "company_logo": item.get("companyLogo"),
+        "job_title": title or "Data Engineering",
+        "company": item.get("company") or item.get("companyName") or "Unknown",
+        "company_url": item.get("companyPageUrl"),
+        "company_logo": item.get("companyLogoUrl"),
         "location": location or "United States",
         "remote": is_remote,
-        "posted_date": item.get("postedDate") or item.get("date"),
-        "scraped_at": item.get("scrapedAt", datetime.utcnow().isoformat()),
-        "url": item.get("url"),
-        "apply_url": item.get("applyUrl") or item.get("url"),
-        "description": item.get("description", ""),
-        "description_html": item.get("descriptionHtml", ""),
+        "posted_date": item.get("posted") or item.get("updated") or item.get("firstActiveDate"),
+        "scraped_at": datetime.utcnow().isoformat(),
+        "url": url,
+        "apply_url": url,
+        "description": description,
+        "description_html": description_html,
         "requirements": None,
         "salary": item.get("salary"),
         "employment_type": item.get("employmentType"),
-        "id": stable_job_id("dice", str(item.get("id") or item.get("url") or item.get("title") or "")),
+        "id": stable_job_id("dice", str(raw_id)),
         "raw_payload": item,
     }
 
 def fetch_dice_jobs_via_apify_api(options: Optional[Dict] = None) -> List[Dict]:
     """
-    Fetch Dice.com jobs via the Apify API.
-    Uses the configured DICE_ACTOR_ID.
+    Fetch Dice.com jobs via the "shahidirfan/Dice-Job-Scraper" Apify actor.
     """
     if options is None:
         options = {}
 
     try:
-        from urllib.parse import quote
-        q = quote(options.get("query", config.JOB_KEYWORDS))
-        l = quote(options.get("location", config.JOB_LOCATION))
-        search_url = f"https://www.dice.com/jobs?q={q}&location={l}"
-
         run_input = {
-            "startUrls": [{"url": search_url}],
-            "maxItems": options.get("maxItems", 50),
-            "proxy": {"useApifyProxy": True}
+            "keyword": options.get("query", config.JOB_KEYWORDS),
+            "location": options.get("location", config.JOB_LOCATION),
+            "posted_date": "all",
+            "results_wanted": options.get("results_wanted", 50),
+            "proxyConfiguration": {"useApifyProxy": True},
         }
 
         log(f"Starting Dice Apify actor ({config.DICE_ACTOR_ID}) with input:")
@@ -78,11 +80,13 @@ def fetch_dice_jobs_via_apify_api(options: Optional[Dict] = None) -> List[Dict]:
             run_timeout=timedelta(seconds=config.APIFY_TIMEOUT_SECONDS),
         )
 
+        dataset_id = getattr(run, "default_dataset_id", None) or (run.get("defaultDatasetId") if isinstance(run, dict) else None)
+
         jobs = []
-        if run and run.get("defaultDatasetId"):
-            log(f"Actor run completed. Dataset ID: {run['defaultDatasetId']}")
-            dataset_items = client.dataset(run["defaultDatasetId"]).list_items().items
-            
+        if dataset_id:
+            log(f"Actor run completed. Dataset ID: {dataset_id}")
+            dataset_items = client.dataset(dataset_id).list_items().items
+
             for item in dataset_items:
                 jobs.append(normalize_dice_job(item))
         else:

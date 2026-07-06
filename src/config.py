@@ -44,7 +44,7 @@ APIFY_TIMEOUT_SECONDS = int(os.getenv("APIFY_TIMEOUT_SECONDS", 300))
 APIFY_MAX_CONCURRENCY = int(os.getenv("APIFY_MAX_CONCURRENCY", 5))
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-DICE_ACTOR_ID = os.getenv("DICE_ACTOR_ID", "lexis-solutions/dice-com-jobs-scraper")
+DICE_ACTOR_ID = os.getenv("DICE_ACTOR_ID", "shahidirfan/Dice-Job-Scraper")
 
 # Daily job report email (sent once per day at 12:00 AM Pakistan Standard Time)
 REPORT_SMTP_EMAIL = os.getenv("REPORT_SMTP_EMAIL")

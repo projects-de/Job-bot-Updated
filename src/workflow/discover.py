@@ -11,6 +11,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")
 from src import config
 from src.discovery.linkedin_api import fetch_linkedin_jobs_via_apify_api
 from src.discovery.indeed_api import fetch_indeed_jobs_via_apify_api
+from src.discovery.dice_api import fetch_dice_jobs_via_apify_api
 from src.storage.tracker import save_jobs, save_summary
 from src.utils.logger import error, log
 
@@ -30,7 +31,7 @@ def canonical_job_url(url):
 
 
 # Preference order when the same role is posted on multiple sources — lower wins.
-SOURCE_PRIORITY = {"linkedin": 0, "indeed": 1}
+SOURCE_PRIORITY = {"linkedin": 0, "indeed": 1, "dice": 2}
 
 
 def _normalize_for_match(value: str) -> str:
@@ -127,12 +128,14 @@ def run_discovery():
         source_jobs = {
             "LinkedIn": [],
             "Indeed": [],
+            "Dice": [],
         }
         errors = []
 
         fetchers = {
             "LinkedIn": fetch_linkedin_jobs_via_apify_api,
             "Indeed": fetch_indeed_jobs_via_apify_api,
+            "Dice": fetch_dice_jobs_via_apify_api,
         }
 
         with ThreadPoolExecutor(max_workers=len(fetchers)) as executor:
@@ -166,7 +169,7 @@ def run_discovery():
                     errors.append(message)
                     error(message)
 
-        all_jobs = source_jobs["LinkedIn"] + source_jobs["Indeed"]
+        all_jobs = source_jobs["LinkedIn"] + source_jobs["Indeed"] + source_jobs["Dice"]
         deduped_jobs = deduplicate_jobs(all_jobs)
         cross_platform_count = sum(1 for j in deduped_jobs if j.get("cross_platform_match"))
 
@@ -178,6 +181,7 @@ def run_discovery():
             "by_source": {
                 "LinkedIn": len(source_jobs["LinkedIn"]),
                 "Indeed": len(source_jobs["Indeed"]),
+                "Dice": len(source_jobs["Dice"]),
             },
             "errors": errors,
         }
@@ -189,9 +193,10 @@ def run_discovery():
 
         log("=== Daily discovery workflow complete ===")
         log(
-            "LinkedIn: {linkedin}, Indeed: {indeed}".format(
+            "LinkedIn: {linkedin}, Indeed: {indeed}, Dice: {dice}".format(
                 linkedin=len(source_jobs["LinkedIn"]),
                 indeed=len(source_jobs["Indeed"]),
+                dice=len(source_jobs["Dice"]),
             )
         )
         log(f"Total Unique Strict Data Engineer Jobs: {len(deduped_jobs)}")

@@ -10,6 +10,7 @@ import {
   Loader2,
   Play,
   Upload,
+  Download,
   SkipForward,
   FileText,
   Sparkles,
@@ -139,6 +140,26 @@ const App: React.FC = () => {
     return Boolean(profile && typeof profile === 'object' && Object.keys(profile).length > 0);
   }, [profile]);
 
+  // Browsers can't render Word docs inline in an <iframe> — check the actual
+  // content-type of the uploaded CV so we can show a "download to view" card
+  // instead of a blank/broken preview for .doc/.docx uploads.
+  const [cvIsPdf, setCvIsPdf] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (!hasProfile) {
+      setCvIsPdf(null);
+      return;
+    }
+    let cancelled = false;
+    axios.head(`${API_BASE}/cv/file?v=${cvVersion}`)
+      .then((res) => {
+        if (cancelled) return;
+        const contentType = String(res.headers['content-type'] || '').toLowerCase();
+        setCvIsPdf(contentType.includes('pdf'));
+      })
+      .catch(() => { if (!cancelled) setCvIsPdf(null); });
+    return () => { cancelled = true; };
+  }, [hasProfile, cvVersion]);
+
   const formatPST = (isoString?: string) => {
     if (!isoString) return 'Never';
     return new Intl.DateTimeFormat('en-US', {
@@ -245,11 +266,14 @@ const App: React.FC = () => {
       // still tailored — it just wasn't submitted — so it belongs in this list too).
       filtered = allJobs.filter((j) => ['tailored', 'ready', 'skipped'].includes((j.status || '').toLowerCase()));
     } else if (overviewMode === 'crossmatch') {
-      // Jobs found on both LinkedIn and Indeed — the "Unique Jobs" card's own list.
-      filtered = jobs.filter((j) => j.cross_platform_match && !['submitted', 'expired', 'skipped'].includes((j.status || '').toLowerCase()));
+      // Jobs found on more than one platform — the "Unique Jobs" card's own list.
+      // Once a job is tailored (or further along) it moves to the Tailored Pipeline
+      // card instead, so this stays discovered-only just like the main list below.
+      filtered = jobs.filter((j) => j.cross_platform_match && (j.status || '').toLowerCase() === 'discovered');
     } else {
-      // Terminal outcomes belong in the Applied Jobs tab, not the active list.
-      filtered = filtered.filter((j) => !['submitted', 'expired', 'skipped'].includes((j.status || '').toLowerCase()));
+      // The main Overview list is discovered-only — the moment a job is tailored it
+      // belongs exclusively in the Tailored Pipeline card, not here too.
+      filtered = filtered.filter((j) => (j.status || '').toLowerCase() === 'discovered');
     }
 
     return filtered.filter((job) =>
@@ -733,6 +757,7 @@ const App: React.FC = () => {
                 <div className="source-breakdown mt-2 text-sm text-muted">
                   <div className="flex justify-between"><span>LinkedIn:</span> <span>{summary?.by_source?.LinkedIn || summary?.by_source?.linkedin || 0}</span></div>
                   <div className="flex justify-between"><span>Indeed:</span> <span>{summary?.by_source?.Indeed || summary?.by_source?.indeed || 0}</span></div>
+                  <div className="flex justify-between"><span>Dice:</span> <span>{summary?.by_source?.Dice || summary?.by_source?.dice || 0}</span></div>
                 </div>
               </div>
 
@@ -740,7 +765,7 @@ const App: React.FC = () => {
                 <div className="stat-label">Unique Jobs</div>
                 <div className="stat-value text-success">{summary?.cross_platform_duplicates || 0}</div>
                 <div className="source-breakdown mt-2 text-sm text-muted">
-                  <p>Posted on both LinkedIn &amp; Indeed</p>
+                  <p>Posted on more than one platform</p>
                 </div>
               </div>
 
@@ -759,17 +784,17 @@ const App: React.FC = () => {
                 <div>
                   <h3>
                     {overviewMode === 'all' ? 'All Discovered Jobs' :
-                     overviewMode === 'crossmatch' ? 'Jobs Posted on Both Platforms' :
+                     overviewMode === 'crossmatch' ? 'Jobs Posted on Multiple Platforms' :
                      overviewMode === 'unique' ? 'Available Jobs' : 'Tailored Pipeline'}
                   </h3>
                   <p>
                     {overviewMode === 'all'
-                      ? 'Showing every discovered role from the latest scan.'
+                      ? 'Showing every not-yet-tailored role from the latest scan.'
                       : overviewMode === 'crossmatch'
-                      ? 'Roles found on both LinkedIn and Indeed — shown once here as their LinkedIn listing.'
+                      ? 'Roles found on more than one platform — shown once here under the preferred source.'
                       : overviewMode === 'unique'
-                      ? 'Showing the deduplicated set — total scraped minus cross-platform duplicates.'
-                      : 'Showing jobs that are tailored and ready for application.'}
+                      ? 'Showing discovered jobs only — once a job is tailored it moves to the Tailored Pipeline card.'
+                      : 'Showing jobs that are tailored, ready, or skipped — anything not yet submitted.'}
                   </p>
                 </div>
                 <span className="badge badge-warning">{overviewJobs.length} Jobs</span>
@@ -932,7 +957,17 @@ const App: React.FC = () => {
                   <div className="parallel-view mb-4">
                     <div className="view-card">
                       <h4>Uploaded CV</h4>
-                      <iframe src={`${API_BASE}/cv/file?v=${cvVersion}`} className="cv-iframe" title="Uploaded CV" />
+                      {cvIsPdf === false ? (
+                        <div className="cv-preview-fallback">
+                          <FileText size={32} style={{ opacity: 0.5 }} />
+                          <p>Word documents can't be previewed inline in the browser — it was still read and parsed successfully (see the profile on the right).</p>
+                          <a href={`${API_BASE}/cv/file?v=${cvVersion}`} target="_blank" rel="noopener noreferrer" className="btn btn-outline btn-small">
+                            <Download size={14} /> Download to view
+                          </a>
+                        </div>
+                      ) : (
+                        <iframe src={`${API_BASE}/cv/file?v=${cvVersion}`} className="cv-iframe" title="Uploaded CV" />
+                      )}
                     </div>
                     <div className="view-card">
                       <h4>Parsed Profile</h4>

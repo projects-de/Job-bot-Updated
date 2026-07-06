@@ -12,6 +12,7 @@ from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage
 
 from src.config import USER_AGENT, CANDIDATE_EMAIL, GROQ_API_KEY
+from src.utils.groq_retry import retry_groq_call
 from src.storage.tracker import log_application, save_tailored_application, JobStatus, APPLICATIONS_DIR, UPLOADS_DIR
 from src.workflow.optimize import render_tailored_cv_latex
 from src.workflow.indeed_apply import IndeedApplier, _is_indeed_url
@@ -161,13 +162,22 @@ def _generate_cv_text_file(cv_data, job_id):
     return filepath
 
 
-def _generate_cover_letter_text_file(cover_letter, job_id):
-    """Generate a plain-text .txt file of the cover letter for form file uploads."""
+def _generate_cover_letter_docx_file(cover_letter, job_id):
+    """
+    Generate a proper .docx cover letter document for form uploads — not every ATS
+    accepts a plain .txt file, so a real Word document is the safer default for
+    the cover-letter file field.
+    """
+    from docx import Document
+
     temp_dir = os.path.join(APPLICATIONS_DIR, job_id)
     os.makedirs(temp_dir, exist_ok=True)
-    filepath = os.path.join(temp_dir, "cover_letter.txt")
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write(cover_letter or "")
+    filepath = os.path.join(temp_dir, "cover_letter.docx")
+
+    doc = Document()
+    for paragraph in (cover_letter or "").split("\n"):
+        doc.add_paragraph(paragraph)
+    doc.save(filepath)
     return filepath
 
 
@@ -189,9 +199,8 @@ def _get_latest_uploaded_resume():
 
 
 class SequentialApplier:
-    def __init__(self, cv_data, tailor_func, cover_letter_func):
+    def __init__(self, cv_data, cover_letter_func):
         self.cv_data = cv_data
-        self.tailor_func = tailor_func
         self.cover_letter_func = cover_letter_func
         self.driver = None
 
@@ -326,16 +335,23 @@ class SequentialApplier:
                 if elements:
                     elements[0].send_keys(os.path.abspath(filepath))
                     self.driver.execute_script("arguments[0].setAttribute('data-bot-uploaded', '1');", elements[0])
+                    time.sleep(1.5)  # let the dropzone's JS process/validate the upload before moving on
                     print(f"  [OK] Uploaded {kind} file via: {selector}")
                     return True
 
-            if kind == "resume":
-                all_file_inputs = _unfilled(self.driver.find_elements(By.CSS_SELECTOR, "input[type='file']"))
-                if all_file_inputs:
-                    all_file_inputs[0].send_keys(os.path.abspath(filepath))
-                    self.driver.execute_script("arguments[0].setAttribute('data-bot-uploaded', '1');", all_file_inputs[0])
-                    print(f"  [OK] Uploaded {kind} file via first unfilled file input")
-                    return True
+            # Fallback: neither semantic selector matched — many forms use generic,
+            # unlabeled file inputs (e.g. a plain "Upload your resume" dropzone with
+            # no name/id/aria-label at all). Fall back to the next unfilled file
+            # input in DOM order: resume fields consistently render before
+            # cover-letter fields, so calling this for "resume" first and
+            # "cover_letter" second naturally targets the right one either way.
+            all_file_inputs = _unfilled(self.driver.find_elements(By.CSS_SELECTOR, "input[type='file']"))
+            if all_file_inputs:
+                all_file_inputs[0].send_keys(os.path.abspath(filepath))
+                self.driver.execute_script("arguments[0].setAttribute('data-bot-uploaded', '1');", all_file_inputs[0])
+                time.sleep(1.5)
+                print(f"  [OK] Uploaded {kind} file via first unfilled file input")
+                return True
 
         except Exception as e:
             print(f"  [WARN] File upload failed ({kind}): {e}")
@@ -685,7 +701,7 @@ Rules:
 Return a JSON array ONLY, no explanation, matching each field by "id" (or "name" if it has no id):
 [{{"id": "field_id_or_empty", "name": "field_name_or_empty", "value": "answer"}}, ...]"""
 
-            response = llm.invoke([HumanMessage(content=prompt)])
+            response = retry_groq_call(lambda: llm.invoke([HumanMessage(content=prompt)]))
             text = response.content.strip()
             if "[" in text and "]" in text:
                 text = text[text.find("["):text.rfind("]") + 1]
@@ -855,7 +871,7 @@ Return a JSON array ONLY, no explanation, matching each field by "id" (or "name"
 
                 uploaded_cl_file = False
                 if cover_letter and job_id:
-                    cl_path = _generate_cover_letter_text_file(cover_letter, job_id)
+                    cl_path = _generate_cover_letter_docx_file(cover_letter, job_id)
                     uploaded_cl_file = self._try_upload_file(cl_path, kind="cover_letter")
                 if cover_letter and not uploaded_cl_file:
                     self._try_fill_any([
@@ -966,9 +982,12 @@ Return a JSON array ONLY, no explanation, matching each field by "id" (or "name"
                 cover_letter = tailored_data.get("cover_letter", "")
                 print(f"Using pre-generated tailored CV and cover letter for {job_title}")
             else:
-                print(f"Tailoring application for {job_title} at {company}...")
+                print(f"Generating cover letter for {job_title} at {company}...")
                 job_desc = job.get('description', '')
-                tailored_cv = self.tailor_func(self.cv_data, job_desc)
+                # CV is used as-is (no LLM rewriting) — only the cover letter is
+                # generated per job description, per explicit instruction to stop
+                # tailoring the CV.
+                tailored_cv = self.cv_data
                 cover_letter = self.cover_letter_func(self.cv_data, job_desc)
                 save_tailored_application(job_id, {
                     "cv": tailored_cv,
@@ -1188,8 +1207,8 @@ Return a JSON array ONLY, no explanation, matching each field by "id" (or "name"
         if self.driver:
             self.driver.quit()
 
-def bulk_apply(jobs, cv_data, tailor_func, cover_letter_func):
-    applier = SequentialApplier(cv_data, tailor_func, cover_letter_func)
+def bulk_apply(jobs, cv_data, cover_letter_func):
+    applier = SequentialApplier(cv_data, cover_letter_func)
     try:
         for job in jobs:
             applier.apply_to_job(job)

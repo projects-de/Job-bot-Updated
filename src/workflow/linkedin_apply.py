@@ -28,6 +28,7 @@ from selenium.common.exceptions import ElementClickInterceptedException
 from selenium.webdriver.common.keys import Keys
 
 from src.config import CANDIDATE_EMAIL, GROQ_API_KEY
+from src.utils.groq_retry import retry_groq_call
 
 
 # ── State ─────────────────────────────────────────────────────────────────────
@@ -442,7 +443,7 @@ Rules:
 Return a JSON array ONLY, no explanation:
 [{{"id": "field_id", "value": "answer"}}, ...]"""
 
-        response = llm.invoke([HumanMessage(content=prompt)])
+        response = retry_groq_call(lambda: llm.invoke([HumanMessage(content=prompt)]))
         text = response.content.strip()
         if "[" in text and "]" in text:
             text = text[text.find("["):text.rfind("]") + 1]

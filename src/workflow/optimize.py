@@ -2,6 +2,7 @@ import json
 import time
 from groq import Groq
 from src.config import GROQ_API_KEY
+from src.utils.groq_retry import retry_groq_call
 
 
 def _latex_escape(value):
@@ -43,33 +44,28 @@ def _normalize_bullets(value):
         return lines if lines else [value.strip()]
     return []
 
-def call_groq_with_retry(messages, model="llama-3.3-70b-versatile", temperature=0.1, max_retries=3):
+def call_groq_with_retry(messages, model="llama-3.3-70b-versatile", temperature=0.1, max_retries=5):
     if not GROQ_API_KEY:
         raise ValueError("GROQ_API_KEY not found in environment")
-    
+
     # Set a 60-second timeout to prevent infinite hangs
     client = Groq(api_key=GROQ_API_KEY, timeout=60.0)
-    
-    for attempt in range(max_retries):
+
+    def _call():
+        response = client.chat.completions.create(
+            messages=messages,
+            model=model,
+            temperature=temperature,
+        )
+        # Log successful API call
         try:
-            response = client.chat.completions.create(
-                messages=messages,
-                model=model,
-                temperature=temperature,
-            )
-            # Log successful API call
-            try:
-                from src.storage.tracker import increment_api_usage
-                increment_api_usage()
-            except:
-                pass
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            if attempt == max_retries - 1:
-                print(f"[ERR] Groq API failed after {max_retries} attempts: {e}")
-                raise e
-            print(f"[WARN] Groq API error (attempt {attempt + 1}/{max_retries}): {e}")
-            time.sleep(2 ** attempt) # Exponential backoff
+            from src.storage.tracker import increment_api_usage
+            increment_api_usage()
+        except Exception:
+            pass
+        return response.choices[0].message.content.strip()
+
+    return retry_groq_call(_call, max_retries=max_retries)
 
 def tailor_cv(cv_data, job_description):
     prompt = f"""
@@ -144,22 +140,39 @@ def generate_cover_letter(cv_data, job_description):
         return call_groq_with_retry(
             [{"role": "user", "content": prompt}],
             temperature=0.7,
-            max_retries=4,
+            max_retries=6,
         )
     except Exception as e:
         print(f"Error generating cover letter: {e}")
-        # Fallback: generate a simpler cover letter with less context
+        # Fallback: a shorter prompt (fewer tokens = more likely to clear a rate
+        # limit), but still carrying enough CV + job specifics that the result
+        # reads as tailored rather than generic boilerplate.
         try:
             name = cv_data.get("full_name", "the candidate")
             summary = cv_data.get("summary", "")
-            simple_prompt = f"""Write a short professional cover letter (150 words max) for {name}.
+            skills = cv_data.get("skills", [])
+            top_skills = ", ".join(str(s) for s in skills[:8]) if isinstance(skills, list) else ""
+            experience = cv_data.get("experience", [])
+            latest_role = ""
+            if isinstance(experience, list) and experience:
+                exp = experience[0]
+                role = exp.get("role") or exp.get("title") or exp.get("job_title", "")
+                company = exp.get("company") or exp.get("organization", "")
+                if role or company:
+                    latest_role = f"{role} at {company}".strip()
+            simple_prompt = f"""Write a job-specific professional cover letter (max 200 words) for {name}.
 Candidate summary: {summary}
-Job context: {job_desc_trimmed[:500]}
-Return only the cover letter text."""
+Key skills: {top_skills}
+Most recent role: {latest_role}
+Job description (may be partial):
+{job_desc_trimmed[:1800]}
+
+Rules: reference specifics from the job description, map them to the candidate's skills/experience above,
+no fabricated claims. Return only the cover letter text, no preamble."""
             return call_groq_with_retry(
                 [{"role": "user", "content": simple_prompt}],
                 temperature=0.7,
-                max_retries=2,
+                max_retries=4,
             )
         except Exception as e2:
             print(f"Fallback cover letter also failed: {e2}")

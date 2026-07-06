@@ -28,7 +28,7 @@ if sys.platform == "win32":
 
 from src.workflow.discover import run_discovery
 from src.utils.cv_processor import process_cv
-from src.workflow.optimize import tailor_cv, generate_cover_letter, render_tailored_cv_latex
+from src.workflow.optimize import generate_cover_letter, render_tailored_cv_latex
 from src.workflow.apply import signal_review_complete
 from src.storage.tracker import (
     get_tracker_summary, 
@@ -384,16 +384,16 @@ def tailor_job(job_id: str):
         raise HTTPException(status_code=400, detail="CV not processed yet")
         
     try:
-        import time as _time
-        print(f"[PROCESS] Tailoring CV for job: {job_id}...")
-        # Truncate description to avoid token limits on either Groq call
+        # Truncate description to avoid token limits on the Groq call
         description = (job.get('description') or '')[:4000]
-        t_cv = tailor_cv(profile, description)
-        
+
+        # CV is used as-is (no LLM rewriting) — only the cover letter is generated
+        # per job description, per explicit instruction to stop tailoring the CV.
+        t_cv = profile
+
         print(f"[PROCESS] Generating cover letter for job: {job_id}...")
-        _time.sleep(1)  # brief pause so back-to-back Groq calls don't hit rate limits
         t_cl = generate_cover_letter(profile, description)
-        
+
         print(f"[PROCESS] Rendering LaTeX version...")
         t_latex = render_tailored_cv_latex(t_cv)
         
@@ -447,9 +447,9 @@ def run_apply_task(selected_jobs, profile):
     
     try:
         from src.workflow.apply import SequentialApplier
-        from src.workflow.optimize import tailor_cv, generate_cover_letter
-        
-        applier = SequentialApplier(profile, tailor_cv, generate_cover_letter)
+        from src.workflow.optimize import generate_cover_letter
+
+        applier = SequentialApplier(profile, generate_cover_letter)
         try:
             for i, job in enumerate(selected_jobs):
                 application_status["current_idx"] = i + 1
