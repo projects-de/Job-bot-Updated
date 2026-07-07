@@ -14,7 +14,7 @@ from langchain_core.messages import HumanMessage
 from src.config import USER_AGENT, CANDIDATE_EMAIL, GROQ_API_KEY
 from src.utils.groq_retry import retry_groq_call
 from src.storage.tracker import log_application, save_tailored_application, JobStatus, APPLICATIONS_DIR, UPLOADS_DIR
-from src.workflow.optimize import render_tailored_cv_latex
+from src.workflow.optimize import render_tailored_cv_latex, _lean_cv_for_prompt
 from src.workflow.indeed_apply import IndeedApplier, _is_indeed_url
 from src.workflow.linkedin_apply import run_linkedin_agent
 import glob
@@ -43,6 +43,28 @@ _NATIVE_SET_VALUE_JS = """
 """
 
 REVIEW_TIMEOUT_SECONDS = 180
+
+# Used to resolve a state abbreviation parsed out of a CV's free-text "City, ST"
+# location string into the full name a <select> option might use instead (or
+# vice versa) — some ATS state dropdowns list "TX", others list "Texas".
+US_STATE_ABBR_TO_NAME = {
+    "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas", "CA": "California",
+    "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware", "FL": "Florida", "GA": "Georgia",
+    "HI": "Hawaii", "ID": "Idaho", "IL": "Illinois", "IN": "Indiana", "IA": "Iowa",
+    "KS": "Kansas", "KY": "Kentucky", "LA": "Louisiana", "ME": "Maine", "MD": "Maryland",
+    "MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota", "MS": "Mississippi", "MO": "Missouri",
+    "MT": "Montana", "NE": "Nebraska", "NV": "Nevada", "NH": "New Hampshire", "NJ": "New Jersey",
+    "NM": "New Mexico", "NY": "New York", "NC": "North Carolina", "ND": "North Dakota", "OH": "Ohio",
+    "OK": "Oklahoma", "OR": "Oregon", "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina",
+    "SD": "South Dakota", "TN": "Tennessee", "TX": "Texas", "UT": "Utah", "VT": "Vermont",
+    "VA": "Virginia", "WA": "Washington", "WV": "West Virginia", "WI": "Wisconsin", "WY": "Wyoming",
+    "DC": "District of Columbia",
+}
+
+# Gender/EEO "voluntary self-identification" fields are almost always legally optional —
+# a CV has no factual basis to answer them, so the safe, consistent behavior is to select
+# whichever option means "I choose not to answer" rather than ever guessing.
+DECLINE_TO_ANSWER_KEYWORDS = ("decline", "prefer not", "do not wish", "don't wish", "not to say", "not disclose")
 
 # Epoch time the current review-wait period expires, or None when no job is
 # currently waiting on human review. A plain dict (not a module-level float) so
@@ -301,6 +323,43 @@ class SequentialApplier:
                 return True
         return False
 
+    def _mark_uploaded(self, el):
+        """
+        Best-effort — some ATS widgets (e.g. Dice's cover-letter dropzone) swap the
+        <input> out of the DOM the instant a file is set (React re-renders the dropzone
+        into a "file attached" card), which makes this throw StaleElementReferenceException
+        even though the upload itself already succeeded. Never let that turn a real
+        success into a reported failure — it's purely a nice-to-have to prevent re-use.
+        """
+        try:
+            self.driver.execute_script("arguments[0].setAttribute('data-bot-uploaded', '1');", el)
+        except Exception:
+            pass
+
+    def _nearby_container_text(self, el):
+        """
+        Text of the nearest reasonably-scoped ancestor container, lowercased — used to
+        tell an unlabeled file input's actual purpose (Resume vs Cover letter) from
+        surrounding heading text when the input has no name/id/aria-label at all (e.g.
+        Dice's cover-letter dropzone input has none of those, only a "Cover letter"
+        heading a few DOM levels up).
+        """
+        try:
+            return (self.driver.execute_script(
+                """
+                let node = arguments[0];
+                for (let i = 0; i < 5 && node; i++) {
+                    const text = (node.innerText || node.textContent || '').trim();
+                    if (text && text.length < 300) return text;
+                    node = node.parentElement;
+                }
+                return '';
+                """,
+                el,
+            ) or "").lower()
+        except Exception:
+            return ""
+
     def _try_upload_file(self, filepath, kind="resume"):
         """
         Try to find a file input and upload a file into it. `kind` is "resume" or
@@ -323,8 +382,6 @@ class SequentialApplier:
                     "input[type='file'][id*='resume' i]",
                     "input[type='file'][aria-label*='resume' i]",
                     "input[type='file'][aria-label*='cv' i]",
-                    "input[type='file'][accept*='pdf' i]",
-                    "input[type='file'][accept*='doc' i]",
                 ]
 
             def _unfilled(elements):
@@ -334,23 +391,55 @@ class SequentialApplier:
                 elements = _unfilled(self.driver.find_elements(By.CSS_SELECTOR, selector))
                 if elements:
                     elements[0].send_keys(os.path.abspath(filepath))
-                    self.driver.execute_script("arguments[0].setAttribute('data-bot-uploaded', '1');", elements[0])
-                    time.sleep(1.5)  # let the dropzone's JS process/validate the upload before moving on
                     print(f"  [OK] Uploaded {kind} file via: {selector}")
+                    self._mark_uploaded(elements[0])
+                    time.sleep(1.5)  # let the dropzone's JS process/validate the upload before moving on
                     return True
 
-            # Fallback: neither semantic selector matched — many forms use generic,
-            # unlabeled file inputs (e.g. a plain "Upload your resume" dropzone with
-            # no name/id/aria-label at all). Fall back to the next unfilled file
-            # input in DOM order: resume fields consistently render before
-            # cover-letter fields, so calling this for "resume" first and
-            # "cover_letter" second naturally targets the right one either way.
+            # No name/id/aria-label match — some ATS forms render a completely unlabeled
+            # <input type="file"> (Dice's cover-letter dropzone, for one), only
+            # distinguishable by the heading text of its surrounding container. Check that
+            # BEFORE any accept-type guess below — otherwise a resume upload can accidentally
+            # grab a cover-letter-only input just because both happen to accept .pdf/.doc,
+            # silently attaching the resume as the "cover letter" and leaving the real one
+            # unsent (this exact bug was confirmed live against Dice's apply wizard).
+            own_keyword = "cover" if kind == "cover_letter" else "resume"
+            other_keyword = "resume" if kind == "cover_letter" else "cover"
+            for el in _unfilled(self.driver.find_elements(By.CSS_SELECTOR, "input[type='file']")):
+                context = self._nearby_container_text(el)
+                if own_keyword in context and other_keyword not in context:
+                    el.send_keys(os.path.abspath(filepath))
+                    print(f"  [OK] Uploaded {kind} file via context-matched input (nearby text: '{own_keyword}')")
+                    self._mark_uploaded(el)
+                    time.sleep(1.5)
+                    return True
+
+            # Accept-type guess for resume only, still excluding anything whose surrounding
+            # text clearly belongs to the cover letter (see reasoning above).
+            if kind != "cover_letter":
+                for selector in ["input[type='file'][accept*='pdf' i]", "input[type='file'][accept*='doc' i]"]:
+                    for el in _unfilled(self.driver.find_elements(By.CSS_SELECTOR, selector)):
+                        if "cover" in self._nearby_container_text(el):
+                            continue
+                        el.send_keys(os.path.abspath(filepath))
+                        print(f"  [OK] Uploaded {kind} file via: {selector}")
+                        self._mark_uploaded(el)
+                        time.sleep(1.5)
+                        return True
+
+            # Last resort: a plain, single, generic file input with nothing else to go on.
+            # Resume fields consistently render before cover-letter fields in DOM order, so
+            # calling this for "resume" first and "cover_letter" second naturally targets
+            # the right one either way — except when the only candidate is clearly the
+            # cover letter's own input (the Dice case), which a resume upload must never take.
             all_file_inputs = _unfilled(self.driver.find_elements(By.CSS_SELECTOR, "input[type='file']"))
+            if kind != "cover_letter":
+                all_file_inputs = [el for el in all_file_inputs if "cover" not in self._nearby_container_text(el)]
             if all_file_inputs:
                 all_file_inputs[0].send_keys(os.path.abspath(filepath))
-                self.driver.execute_script("arguments[0].setAttribute('data-bot-uploaded', '1');", all_file_inputs[0])
-                time.sleep(1.5)
                 print(f"  [OK] Uploaded {kind} file via first unfilled file input")
+                self._mark_uploaded(all_file_inputs[0])
+                time.sleep(1.5)
                 return True
 
         except Exception as e:
@@ -372,45 +461,100 @@ class SequentialApplier:
             pass
 
         print("  Form fields not visible. Searching for initial 'Apply' / 'Apply Now' button on portal...")
-        
-        apply_selectors = [
-            "xpath://a[contains(translate(., 'APLY', 'aply'), 'apply') and not(contains(translate(., 'EASY', 'easy'), 'easy'))]",
-            "xpath://button[contains(translate(., 'APLY', 'aply'), 'apply') and not(contains(translate(., 'EASY', 'easy'), 'easy'))]",
-            "a[href*='/apply' i]",
-            "a[href*='apply' i]",
-            "button[class*='apply' i]",
-            "a[class*='apply' i]",
-            "a[class*='btn' i]",
-            "button[class*='btn' i]"
-        ]
 
-        for sel in apply_selectors:
+        # No "not Easy Apply" exclusion here — this only ever runs on a site's OWN
+        # page for sources without a dedicated agent (e.g. Dice), or on the external
+        # redirect target for LinkedIn/Indeed (never their own page, which their
+        # dedicated agents already handle) — so an "Easy Apply" button here (Dice
+        # uses that exact label) is always the right thing to click, not LinkedIn's.
+        #
+        # The find-and-click happens as a single atomic JS call rather than
+        # Selenium find_elements() + a separate .click() round-trip: some job
+        # pages (e.g. Dice) keep re-rendering their DOM continuously for several
+        # seconds after load (ads/analytics/hydration), which turns a
+        # Selenium WebElement handle stale in the gap between finding it and
+        # clicking it — including the JS-click-by-reference fallback, since that
+        # still reuses the same now-detached handle. Re-querying by text from
+        # inside one script call sidesteps that entirely.
+        find_and_click_js = """
+            function isVisible(el) {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+            }
+            const candidates = Array.from(document.querySelectorAll('a, button'));
+
+            function tryClick(matcher) {
+                for (const el of candidates) {
+                    const text = (el.innerText || el.textContent || '').trim();
+                    const aria = (el.getAttribute('aria-label') || '').trim();
+                    const href = el.getAttribute('href') || '';
+                    const haystack = (text + ' ' + aria + ' ' + href).toLowerCase();
+                    if (!matcher(haystack)) continue;
+                    if (el.disabled) continue;
+                    if (!isVisible(el)) continue;
+                    el.scrollIntoView({block: 'center'});
+                    el.click();
+                    return {clicked: true, text: text, href: href};
+                }
+                return null;
+            }
+
+            // Priority 1: anything mentioning "apply" — unchanged from before, this is
+            // exactly what matches Dice's "Easy Apply" button and every other site's
+            // "Apply"/"Apply Now", so it keeps matching first, same as always.
+            let result = tryClick(h => h.includes('apply'));
+            if (!result) {
+                // Priority 2 (fallback only): some external ATS forms use different
+                // first-screen wording instead of "apply" at all.
+                result = tryClick(h => h.includes('continue') || h.includes('get started') || h.includes('start application'));
+            }
+            return result || {clicked: false};
+        """
+
+        deadline = time.time() + 15
+        while time.time() < deadline:
             try:
-                by_type = By.XPATH if sel.startswith("xpath:") else By.CSS_SELECTOR
-                actual_sel = sel[6:] if sel.startswith("xpath:") else sel
-                elements = self.driver.find_elements(by_type, actual_sel)
-                for el in elements:
-                    if el.is_displayed() and el.is_enabled():
-                        text = el.text.strip().replace("\n", " ")
-                        href = el.get_attribute("href") or ""
-                        print(f"  [OK] Found initial apply button: '{text}' (href='{href}'). Clicking it...")
-                        self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-                        time.sleep(0.3)
-                        try:
-                            el.click()
-                        except Exception:
-                            self.driver.execute_script("arguments[0].click();", el)
-                        time.sleep(3.5) # Wait for page or form container to render
-                        self.wait_for_cloudflare()
-                        return True
+                result = self.driver.execute_script(find_and_click_js) or {}
             except Exception as e:
-                print(f"  [DEBUG] Error checking initial apply selector '{sel}': {e}")
-        
+                print(f"  [DEBUG] Apply-button search script error: {e}")
+                result = {}
+
+            if result.get("clicked"):
+                print(f"  [OK] Clicked initial apply button: '{result.get('text', '')}' (href='{result.get('href', '')}')")
+                time.sleep(3.5)  # Wait for page or form container to render
+                self.wait_for_cloudflare()
+                return True
+
+            time.sleep(0.4)
+
         print("  [WARN] No initial apply button found or clicked.")
         return False
 
+    def _select_dropdown_by_text_variants(self, select_el, variants):
+        """Select the first <select> option whose visible text matches (exact, then substring) any variant."""
+        try:
+            sel_obj = Select(select_el)
+            options = sel_obj.options
+            lowered = [v.strip().lower() for v in variants if v]
+            for opt in options:
+                if opt.text.strip().lower() in lowered:
+                    sel_obj.select_by_visible_text(opt.text)
+                    return True
+            for opt in options:
+                opt_l = opt.text.strip().lower()
+                if any(v and v in opt_l for v in lowered):
+                    sel_obj.select_by_visible_text(opt.text)
+                    return True
+        except Exception:
+            pass
+        return False
+
     def _fill_identity_and_links(self, tailored_cv):
-        """Deterministic pass: name, email, phone, address/location, and profile links."""
+        """Deterministic pass: name, email, phone, address/location, state/country, and profile links.
+        Returns how many distinct fields were successfully filled/selected, so callers can detect a
+        step where the page didn't match any known selector at all (worth a loud warning, not a
+        silent no-op) instead of just a partially-filled one."""
         full_name = tailored_cv.get("full_name", "")
         email = tailored_cv.get("email", "") or CANDIDATE_EMAIL
         phone = tailored_cv.get("phone", "")
@@ -421,43 +565,69 @@ class SequentialApplier:
         first_name = name_parts[0] if name_parts else ""
         last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
 
-        self._try_fill_any([
+        filled_count = 0
+
+        if self._try_fill_any([
             "input[name*='full_name' i]", "input[id*='full_name' i]",
             "input[name*='fullname' i]", "input[id*='fullname' i]",
             "input[name*='display_name' i]", "input[id*='display_name' i]",
             "input[name*='name' i][name*='full' i]",
             "input[placeholder*='full name' i]",
-        ], full_name)
+        ], full_name):
+            filled_count += 1
 
-        self._try_fill_any([
+        if self._try_fill_any([
             "input[name*='first_name' i]", "input[id*='first_name' i]",
             "input[name*='firstname' i]", "input[id*='firstname' i]",
             "input[name*='given' i]", "input[id*='given' i]",
             "input[placeholder*='first name' i]",
-        ], first_name)
+        ], first_name):
+            filled_count += 1
 
-        self._try_fill_any([
+        if self._try_fill_any([
             "input[name*='last_name' i]", "input[id*='last_name' i]",
             "input[name*='lastname' i]", "input[id*='lastname' i]",
             "input[name*='surname' i]", "input[id*='surname' i]",
             "input[name*='family' i]", "input[id*='family' i]",
             "input[placeholder*='last name' i]",
-        ], last_name)
+        ], last_name):
+            filled_count += 1
 
-        self._try_fill_any([
+        if self._try_fill_any([
             "input[type='email']",
             "input[name*='email' i]", "input[id*='email' i]",
             "input[placeholder*='email' i]",
-        ], email)
+        ], email):
+            filled_count += 1
+
+        # Confirm/verify-email fields (e.g. Kforce's "Verify Email") never appear in CV
+        # data, so they must be deterministically mirrored from the primary email rather
+        # than left for the LLM pass, which has no visibility into what was already typed
+        # into a different field on the same page.
+        if email:
+            verify_filled = self._try_fill_any([
+                "input[name*='email' i][name*='verify' i]", "input[id*='email' i][id*='verify' i]",
+                "input[name*='email' i][name*='confirm' i]", "input[id*='email' i][id*='confirm' i]",
+                "input[name*='confirm' i][name*='email' i]", "input[id*='confirm' i][id*='email' i]",
+                "input[placeholder*='verify email' i]", "input[placeholder*='confirm email' i]",
+                "input[placeholder*='re-enter email' i]", "input[placeholder*='reenter email' i]",
+            ], email)
+            if not verify_filled:
+                # Fall back to any other still-empty type=email input — covers a second/confirm
+                # email field that doesn't literally say "verify"/"confirm" in its name.
+                verify_filled = self._try_fill_any(["input[type='email']"], email)
+            if verify_filled:
+                filled_count += 1
 
         if phone:
-            self._try_fill_any([
+            if self._try_fill_any([
                 "input[type='tel']",
                 "input[name*='phone' i]", "input[id*='phone' i]",
                 "input[name*='mobile' i]", "input[id*='mobile' i]",
                 "input[name*='telephone' i]", "input[id*='telephone' i]",
                 "input[placeholder*='phone' i]", "input[placeholder*='mobile' i]",
-            ], phone)
+            ], phone):
+                filled_count += 1
 
         if location:
             # Covers plain "location/city" fields as well as street-address-style
@@ -465,7 +635,7 @@ class SequentialApplier:
             # Explicitly excludes anything mentioning "email" — a placeholder like
             # "Email address" contains the substring "address" and would otherwise
             # match these selectors and get overwritten with the location value.
-            self._try_fill_any([
+            if self._try_fill_any([
                 "input[name*='location' i]:not([name*='email' i])",
                 "input[id*='location' i]:not([id*='email' i])",
                 "input[name*='city' i]:not([name*='email' i])",
@@ -477,39 +647,80 @@ class SequentialApplier:
                 "input[placeholder*='city' i]:not([placeholder*='email' i])",
                 "input[placeholder*='address' i]:not([placeholder*='email' i]):not([type='email'])",
                 "input[placeholder*='location' i]:not([placeholder*='email' i])",
-            ], location)
+            ], location):
+                filled_count += 1
+
+            # State/Country <select> dropdowns — very common on US ATS forms (Kforce,
+            # Workday, etc.) and never handled by the plain text-field pass above since
+            # a <select> has no "value" to type into. Parsed from "City, ST" (or
+            # "City, State") in the CV's location string.
+            state_token = location.split(",")[-1].strip() if "," in location else ""
+            if state_token:
+                state_name = US_STATE_ABBR_TO_NAME.get(state_token.upper(), "")
+                variants = [state_token, state_name] if state_name else [state_token]
+                for sel_el in self.driver.find_elements(
+                    By.CSS_SELECTOR,
+                    "select[name*='state' i]:not([name*='country' i]), select[id*='state' i]:not([id*='country' i])"
+                ):
+                    if sel_el.is_displayed():
+                        if self._select_dropdown_by_text_variants(sel_el, variants):
+                            print(f"  [OK] State dropdown selected: {state_token}")
+                            filled_count += 1
+                        break
+
+            # Country — only touched if it's still on a placeholder ("Select...", etc);
+            # many forms already default to a sensible value and shouldn't be clobbered.
+            for sel_el in self.driver.find_elements(By.CSS_SELECTOR, "select[name*='country' i], select[id*='country' i]"):
+                if sel_el.is_displayed():
+                    try:
+                        current = Select(sel_el).first_selected_option.text.strip()
+                    except Exception:
+                        current = ""
+                    if not current or current.lower() in ("select...", "select one", "please select", "-- select --", ""):
+                        if self._select_dropdown_by_text_variants(
+                            sel_el, ["United States", "United States of America", "USA", "US"]
+                        ):
+                            print("  [OK] Country dropdown selected: United States")
+                            filled_count += 1
+                    break
 
         links = tailored_cv.get('links', [])
         if isinstance(links, list):
             for link in links:
                 l_lower = link.lower()
                 if 'linkedin' in l_lower:
-                    self._try_fill_any([
+                    if self._try_fill_any([
                         "input[name*='linkedin' i]", "input[id*='linkedin' i]",
                         "input[placeholder*='linkedin' i]",
                         "input[name*='link' i][name*='in' i]",
-                    ], link)
+                    ], link):
+                        filled_count += 1
                 elif 'github' in l_lower:
-                    self._try_fill_any([
+                    if self._try_fill_any([
                         "input[name*='github' i]", "input[id*='github' i]",
                         "input[placeholder*='github' i]",
                         "input[name*='git' i]",
-                    ], link)
+                    ], link):
+                        filled_count += 1
                 elif 'portfolio' in l_lower or 'website' in l_lower:
-                    self._try_fill_any([
+                    if self._try_fill_any([
                         "input[name*='portfolio' i]", "input[id*='portfolio' i]",
                         "input[name*='website' i]", "input[id*='website' i]",
                         "input[placeholder*='website' i]",
                         "input[placeholder*='portfolio' i]",
                         "input[name*='personal' i][name*='site' i]",
-                    ], link)
+                    ], link):
+                        filled_count += 1
 
         if summary:
-            self._try_fill_any([
+            if self._try_fill_any([
                 "textarea[name*='summary' i]", "textarea[id*='summary' i]",
                 "textarea[name*='about' i]", "textarea[id*='about' i]",
                 "textarea[placeholder*='summary' i]",
-            ], summary)
+            ], summary):
+                filled_count += 1
+
+        return filled_count
 
     def _click_consent_checkboxes(self):
         try:
@@ -543,6 +754,11 @@ class SequentialApplier:
 
                 is_sponsorship = any(k in aria or k in name or k in text_content for k in ("sponsor", "visa", "sponsorship"))
                 is_auth = any(k in aria or k in name or k in text_content for k in ("authorized", "legally", "permit"))
+                is_relocate = "relocat" in aria or "relocat" in name or "relocat" in text_content
+                is_gender = (
+                    "gender" in aria or "gender" in name or "gender" in text_content
+                    or "sex" in aria.split() or "sex" in name.split() or "sex" in text_content.split()
+                )
 
                 sel_obj = Select(sel)
 
@@ -560,8 +776,116 @@ class SequentialApplier:
                             sel_obj.select_by_visible_text(opt.text)
                             print(f"  [OK] Work Auth dropdown auto-filled: {opt.text}")
                             break
+                elif is_relocate:
+                    # Fixed personal-preference answer (not derivable from a CV) — set once,
+                    # applied consistently across every application.
+                    for opt in sel_obj.options:
+                        opt_text = (opt.text or "").lower()
+                        if opt_text.strip() in ("no", "false", "n"):
+                            sel_obj.select_by_visible_text(opt.text)
+                            print(f"  [OK] Relocation dropdown auto-filled: {opt.text}")
+                            break
+                elif is_gender:
+                    # Never guess a gender — only act if a "decline to answer" style
+                    # option actually exists; otherwise leave it for the LLM/human rather
+                    # than pick Male/Female with no CV basis for either.
+                    for opt in sel_obj.options:
+                        opt_text = (opt.text or "").lower()
+                        if any(k in opt_text for k in DECLINE_TO_ANSWER_KEYWORDS):
+                            sel_obj.select_by_visible_text(opt.text)
+                            print(f"  [OK] Gender/self-ID dropdown auto-filled: {opt.text}")
+                            break
         except Exception as se:
             print(f"  [WARN] Dropdown auto-filling error: {se}")
+
+    def _radio_label(self, el):
+        gid = el.get_attribute("id") or ""
+        label = ""
+        if gid:
+            try:
+                label = self.driver.find_element(By.CSS_SELECTOR, f"label[for='{gid}']").text.strip()
+            except Exception:
+                pass
+        return (label or el.get_attribute("value") or "").strip().lower()
+
+    def _fill_known_radio_groups(self):
+        """
+        Rule-based auto-fill for screening questions whose answer is a fixed personal
+        preference or a legally-optional non-answer rather than a CV fact (e.g. "willing
+        to relocate?", gender/voluntary self-identification) — a CV has no way to answer
+        these, so without this they're left for the LLM pass, which has no real basis to
+        answer them either and correctly (per its own rules) leaves them blank rather
+        than guess.
+        """
+        try:
+            seen_names = set()
+            for r in self.driver.find_elements(By.CSS_SELECTOR, "input[type='radio']"):
+                name = r.get_attribute("name") or ""
+                if not name or name in seen_names:
+                    continue
+                group = self.driver.find_elements(By.CSS_SELECTOR, f"input[type='radio'][name='{name}']")
+                if not any(g.is_displayed() for g in group):
+                    continue
+                seen_names.add(name)
+                if any(g.is_selected() for g in group):
+                    continue
+
+                context = self._nearby_container_text(group[0])
+
+                if "relocat" in context:
+                    for g in group:
+                        if self._radio_label(g) == "no" and not g.is_selected():
+                            self.driver.execute_script("arguments[0].click();", g)
+                            print(f"  [OK] Relocation radio auto-filled ('{name}'): No")
+                            break
+                elif "gender" in context or "sex" in context.split():
+                    # Never guess a gender — only act if a "decline to answer" style
+                    # option actually exists; otherwise leave it for the LLM/human rather
+                    # than pick Male/Female with no CV basis for either.
+                    for g in group:
+                        label = self._radio_label(g)
+                        if any(k in label for k in DECLINE_TO_ANSWER_KEYWORDS) and not g.is_selected():
+                            self.driver.execute_script("arguments[0].click();", g)
+                            print(f"  [OK] Gender/self-ID radio auto-filled ('{name}'): {label}")
+                            break
+        except Exception as e:
+            print(f"  [WARN] Known radio-group auto-fill error: {e}")
+
+    def _fill_date_inputs(self):
+        """
+        Deterministically fill empty <input type="date"> fields with today's date —
+        native date pickers ignore plain send_keys text entirely, so without this
+        they're silently skipped by every other fill pass (all of which only know how
+        to type into text-like inputs).
+        """
+        try:
+            today_iso = time.strftime("%Y-%m-%d")
+            for el in self.driver.find_elements(By.CSS_SELECTOR, "input[type='date']"):
+                if not el.is_displayed():
+                    continue
+                if (el.get_attribute("value") or "").strip():
+                    continue
+                self.driver.execute_script(_NATIVE_SET_VALUE_JS, el, today_iso)
+                print(f"  [OK] Date field filled with today's date: {today_iso}")
+        except Exception as e:
+            print(f"  [WARN] Date field auto-fill error: {e}")
+
+    def _fill_range_sliders(self, default_percent="0"):
+        """
+        Deterministically set <input type="range"> sliders (e.g. '% of days willing to
+        travel') to a fixed default — sliders have no text value to type into, so
+        send_keys never works on them; the value must be set directly via JS.
+        """
+        try:
+            for el in self.driver.find_elements(By.CSS_SELECTOR, "input[type='range']"):
+                if not el.is_displayed():
+                    continue
+                if (el.get_attribute("value") or "").strip() == str(default_percent):
+                    continue
+                self.driver.execute_script(_NATIVE_SET_VALUE_JS, el, str(default_percent))
+                print(f"  [OK] Range slider set to: {default_percent}")
+        except Exception as e:
+            print(f"  [WARN] Range slider auto-fill error: {e}")
 
     def _field_label(self, el):
         try:
@@ -674,6 +998,7 @@ class SequentialApplier:
             return []
         try:
             llm = ChatGroq(api_key=GROQ_API_KEY, model="llama-3.3-70b-versatile", temperature=0)
+            fallback_llm = ChatGroq(api_key=GROQ_API_KEY, model="llama-3.1-8b-instant", temperature=0)
             prompt = f"""You are a job application assistant filling out an external company application form
 (not LinkedIn/Indeed's own flow — this is a company careers site or ATS like Greenhouse/Workday/Lensa).
 
@@ -681,10 +1006,10 @@ CURRENT PAGE TEXT (for context):
 {page_text[:1200]}
 
 VISIBLE UNFILLED FIELDS:
-{json.dumps(fields, indent=2)}
+{json.dumps(fields, separators=(',', ':'))}
 
 CANDIDATE CV:
-{json.dumps(cv_data, indent=2)}
+{json.dumps(_lean_cv_for_prompt(cv_data), separators=(',', ':'))}
 
 TASK: Return the correct value for each field based ONLY on the candidate's CV.
 Rules:
@@ -694,14 +1019,26 @@ Rules:
 - work authorization / eligibility -> pick the option meaning "Yes".
 - visa sponsorship required -> pick the option meaning "No".
 - "how did you hear about us" -> pick "LinkedIn" or the closest option.
-- salary / compensation expectations -> leave empty ("").
+- salary / compensation expectations -> if it's a dropdown/select with an option meaning
+  "Negotiable", choose that option; otherwise leave empty ("").
+- "willing to relocate" (in any phrasing, including "at your own expense") -> "No".
+- "licenses and certifications" -> list them from the CANDIDATE CV if present, otherwise
+  answer exactly "N.A.".
+- gender / sex / voluntary self-identification -> if one of the options means "Decline to
+  self-identify" or "Prefer not to say", choose that one; never guess Male/Female — if no
+  such option exists, return "".
+- "verify/confirm/re-enter email" -> repeat the exact "email" value from the CANDIDATE CV above.
+- "verify/confirm/re-enter phone" -> repeat the exact "phone" value from the CANDIDATE CV above.
 - open-text questions -> 1-2 sentences using CV evidence only, never fabricate.
 - if a field can't be answered from the CV -> return "".
 
 Return a JSON array ONLY, no explanation, matching each field by "id" (or "name" if it has no id):
 [{{"id": "field_id_or_empty", "name": "field_name_or_empty", "value": "answer"}}, ...]"""
 
-            response = retry_groq_call(lambda: llm.invoke([HumanMessage(content=prompt)]))
+            response = retry_groq_call(
+                lambda: llm.invoke([HumanMessage(content=prompt)]),
+                fallback_fn=lambda: fallback_llm.invoke([HumanMessage(content=prompt)]),
+            )
             text = response.content.strip()
             if "[" in text and "]" in text:
                 text = text[text.find("["):text.rfind("]") + 1]
@@ -858,13 +1195,43 @@ Return a JSON array ONLY, no explanation, matching each field by "id" (or "name"
         reached (left for the human to review and submit) or the form gets stuck.
         """
         try:
-            self._click_initial_apply_button()
+            handles_before_click = self.driver.window_handles
+            clicked = self._click_initial_apply_button()
+
+            if clicked:
+                # Many "Apply on company site" buttons open a new tab (target="_blank").
+                # If we don't switch into it, every subsequent find/fill call below keeps
+                # operating on the old tab, which has no form on it at all — silently
+                # "filling nothing" even though the click itself worked. LinkedIn's and
+                # Indeed's own external-redirect branches already do this before calling
+                # fill_form; this covers every other caller (Dice, generic sites) and any
+                # second-level redirect those branches don't check for.
+                time.sleep(1.0)  # give a same-process popup a moment to register as a new handle
+                handles_after_click = self.driver.window_handles
+                if len(handles_after_click) > len(handles_before_click):
+                    new_tab = [h for h in handles_after_click if h not in handles_before_click][-1]
+                    self.driver.switch_to.window(new_tab)
+                    print("  [OK] Switched to newly opened tab for the application form.")
+                    self.wait_for_cloudflare()
 
             max_steps = 6
             stuck_count = 0
 
             for step in range(max_steps):
-                self._fill_identity_and_links(tailored_cv)
+                identity_filled = self._fill_identity_and_links(tailored_cv)
+                if step == 0 and identity_filled == 0:
+                    # A slow-hydrating page (heavy JS ATS widgets) can still be rendering
+                    # when the first pass runs, landing on zero matches for reasons that
+                    # have nothing to do with selector coverage. One short wait-and-retry
+                    # rules that out before treating it as a real "unrecognized form".
+                    print("  [WARN] No identity fields matched on first pass — waiting and retrying "
+                          "once in case the page was still rendering...")
+                    time.sleep(2.5)
+                    identity_filled = self._fill_identity_and_links(tailored_cv)
+                    if identity_filled == 0:
+                        print("  [WARN] Still no identity fields (name/email/phone/etc) matched any "
+                              "known selector on this page — this site's form may use an unrecognized "
+                              "field naming pattern. Falling back to LLM field detection for everything.")
 
                 if cv_filepath and os.path.exists(cv_filepath):
                     self._try_upload_file(cv_filepath, kind="resume")
@@ -883,6 +1250,9 @@ Return a JSON array ONLY, no explanation, matching each field by "id" (or "name"
 
                 self._click_consent_checkboxes()
                 self._fill_known_dropdowns()
+                self._fill_known_radio_groups()
+                self._fill_date_inputs()
+                self._fill_range_sliders()
 
                 page_text = self._page_signature()
                 remaining_fields = self._collect_unfilled_fields()

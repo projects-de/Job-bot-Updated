@@ -144,15 +144,24 @@ def run_discovery():
                 source = future_map[future]
                 try:
                     jobs = future.result() or []
-                    
+
+                    if not jobs:
+                        # Not necessarily a bug — a source can legitimately have 0 matching
+                        # postings — but it's also what a silently-blocked/rate-limited scrape
+                        # looks like, so flag it instead of letting it look identical to "0
+                        # jobs, all good" in the dashboard.
+                        message = f"{source} returned 0 jobs this scan (may be a genuine 0, or a blocked/failed fetch — check the scan log for that source's fetch attempts above)"
+                        errors.append(message)
+                        log(f"WARNING: {message}")
+
                     # Strictly filter for Data Engineer before saving or showing
                     filtered_jobs = [j for j in jobs if is_strict_data_engineer(j)]
                     if len(jobs) > len(filtered_jobs):
                         log(f"Filtered out {len(jobs) - len(filtered_jobs)} non-Data Engineer jobs from {source}.")
-                    
+
                     jobs = filtered_jobs
                     source_jobs[source] = jobs
-                    
+
                     # Live Update: Save jobs from this source immediately so they show up in UI
                     if jobs:
                         try:
@@ -202,6 +211,8 @@ def run_discovery():
         log(f"Total Unique Strict Data Engineer Jobs: {len(deduped_jobs)}")
         if errors:
             log(f"Discovery finished with warnings: {errors}")
+
+        return summary
 
     except Exception as exc:
         error(f"Daily discovery workflow failed: {exc}")

@@ -48,16 +48,22 @@ def parse_cv_with_ai(cv_text):
     - projects (a list of objects with title and description)
 
     Return ONLY the raw JSON.
-    
+
     CV TEXT:
-    {cv_text}
+    {(cv_text or "")[:6000]}
     """
     
-    response = retry_groq_call(lambda: client.chat.completions.create(
-        messages=[{"role": "user", "content": prompt}],
-        model="llama-3.3-70b-versatile",
-        temperature=0.1,
-    ))
+    def _call(model):
+        return client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model=model,
+            temperature=0.1,
+        )
+
+    response = retry_groq_call(
+        lambda: _call("llama-3.3-70b-versatile"),
+        fallback_fn=lambda: _call("llama-3.1-8b-instant"),
+    )
 
     try:
         text = response.choices[0].message.content.strip()

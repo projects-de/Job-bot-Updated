@@ -1,8 +1,13 @@
 import json
 import os
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+# Same fixed-offset Pakistan Standard Time used by the daily report
+# (src/workflow/daily_report.py) — kept in sync so the dashboard's "today" and
+# the emailed report's "today" always agree on the same calendar-day boundary.
+PKT = timezone(timedelta(hours=5))
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
@@ -117,6 +122,31 @@ def get_tracker_summary() -> dict:
         return _read_tracker()
 
 
+def _pkt_date(iso_string: str):
+    """PKT calendar date of an ISO timestamp, or None if unparseable/empty."""
+    if not iso_string:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso_string.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(PKT).date()
+    except ValueError:
+        return None
+
+
+def is_tailored_today(created_at: str) -> bool:
+    """
+    Whether a job's tracker entry was first tailored on the current PKT
+    calendar day. A job's `created_at` is written exactly once, at the moment
+    it's first tailored (DISCOVERED is never persisted to tracker.json — it's
+    only a UI default for jobs with no entry yet), so `created_at` doubles as
+    "tailored_at" without needing a separate field.
+    """
+    entry_date = _pkt_date(created_at)
+    return entry_date is not None and entry_date == datetime.now(PKT).date()
+
+
 def save_parsed_profile(profile: dict):
     _ensure_dirs()
     path = os.path.join(PROFILES_DIR, "parsed_profile.json")
@@ -164,10 +194,16 @@ def get_dashboard_stats() -> dict:
         JobStatus.EXPIRED: 0,
         JobStatus.SKIPPED: 0,
     }
+    tailored_today = 0
     for entry in apps:
         s = entry.get("status")
         if s in counts:
             counts[s] += 1
+        # Tailored/Ready/Skipped all originate from the same TAILORED write (see
+        # is_tailored_today), so created_at is that job's tailoring date regardless
+        # of which of the three statuses it's since moved to.
+        if s in (JobStatus.TAILORED, JobStatus.READY, JobStatus.SKIPPED) and is_tailored_today(entry.get("created_at")):
+            tailored_today += 1
 
     return {
         "total": len(apps),
@@ -175,7 +211,10 @@ def get_dashboard_stats() -> dict:
         # A skipped job still went through tailoring (CV/cover letter were generated for
         # it before the user reviewed and skipped it in-browser), so it counts toward the
         # "Tailored" stat on the dashboard and appears in the Tailored Pipeline list too.
+        # This is the all-time total (kept for anything else that relies on it) —
+        # "tailored_today" below is the day-scoped count the live dashboard card uses.
         "tailored": counts[JobStatus.TAILORED] + counts[JobStatus.SKIPPED],
+        "tailored_today": tailored_today,
         "ready": counts[JobStatus.READY],
         "submitted": counts[JobStatus.SUBMITTED],
         "failed": counts[JobStatus.FAILED],

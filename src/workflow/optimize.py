@@ -1,5 +1,6 @@
 import json
 import time
+from datetime import datetime
 from groq import Groq
 from src.config import GROQ_API_KEY
 from src.utils.groq_retry import retry_groq_call
@@ -44,17 +45,17 @@ def _normalize_bullets(value):
         return lines if lines else [value.strip()]
     return []
 
-def call_groq_with_retry(messages, model="llama-3.3-70b-versatile", temperature=0.1, max_retries=5):
+def call_groq_with_retry(messages, model="llama-3.3-70b-versatile", temperature=0.1, max_retries=5, fallback_model="llama-3.1-8b-instant"):
     if not GROQ_API_KEY:
         raise ValueError("GROQ_API_KEY not found in environment")
 
     # Set a 60-second timeout to prevent infinite hangs
     client = Groq(api_key=GROQ_API_KEY, timeout=60.0)
 
-    def _call():
+    def _call(m):
         response = client.chat.completions.create(
             messages=messages,
-            model=model,
+            model=m,
             temperature=temperature,
         )
         # Log successful API call
@@ -65,7 +66,8 @@ def call_groq_with_retry(messages, model="llama-3.3-70b-versatile", temperature=
             pass
         return response.choices[0].message.content.strip()
 
-    return retry_groq_call(_call, max_retries=max_retries)
+    fallback_fn = (lambda: _call(fallback_model)) if fallback_model and fallback_model != model else None
+    return retry_groq_call(lambda: _call(model), max_retries=max_retries, fallback_fn=fallback_fn)
 
 def tailor_cv(cv_data, job_description):
     prompt = f"""
@@ -108,75 +110,192 @@ def tailor_cv(cv_data, job_description):
         print(f"Error tailoring CV: {e}")
         return cv_data  # Fallback to original
 
-def generate_cover_letter(cv_data, job_description):
-    # Truncate to stay well within token limits
-    job_desc_trimmed = (job_description or "")[:3000]
+def _lean_cv_for_prompt(cv_data, max_experience=2, max_bullets=2, max_skills=10):
+    """
+    Trim the CV down to only what an LLM prompt actually needs (name, summary,
+    skills, recent experience highlights, education) — the full CV JSON runs
+    ~1,300 tokens on its own, which matters on Groq's token quota when several
+    jobs get processed back-to-back. Defaults are deliberately lean since most
+    callers (form-field answering) only need facts, not narrative depth;
+    generate_cover_letter below passes richer explicit limits since it's the
+    one place where more CV detail directly improves output quality.
+    """
+    experience = cv_data.get("experience", [])
+    lean_experience = []
+    if isinstance(experience, list):
+        for exp in experience[:max_experience]:
+            role = exp.get("role") or exp.get("title") or exp.get("job_title", "")
+            company = exp.get("company") or exp.get("organization", "")
+            duration = exp.get("duration") or exp.get("dates") or exp.get("period", "")
+            desc = exp.get("description") or exp.get("bullet_points") or exp.get("highlights")
+            if isinstance(desc, list):
+                bullets = [str(b) for b in desc[:max_bullets]]
+            elif isinstance(desc, str):
+                bullets = [b.strip("-•* ").strip() for b in desc.split("\n") if b.strip()][:max_bullets]
+            else:
+                bullets = []
+            lean_experience.append({"role": role, "company": company, "duration": duration, "highlights": bullets})
 
-    prompt = f"""
-    Write a job-specific professional cover letter based ONLY on the candidate CV and this job description.
+    education = cv_data.get("education", [])
+    lean_education = []
+    if isinstance(education, list):
+        for edu in education[:2]:
+            lean_education.append({
+                "degree": edu.get("degree") or edu.get("title", ""),
+                "institution": edu.get("institution") or edu.get("school", ""),
+            })
 
-    Requirements:
-    - Maximum 280 words.
-    - No fabricated experience, tools, projects, or claims.
-    - Must map job requirements directly to existing CV evidence.
-    - Professional business format:
-      1) Salutation,
-      2) Opening with role interest,
-      3) 1-2 body paragraphs with role-specific fit,
-      4) Short closing and signature line.
-    - Keep tone professional, direct, and specific to this job description.
-    - Avoid generic filler.
+    skills = cv_data.get("skills", [])
+    return {
+        "full_name": cv_data.get("full_name", ""),
+        # Cheap scalar facts (a few tokens each) — kept even in the lean version because
+        # form-field answering genuinely needs them, e.g. a "Verify/Confirm Email" field
+        # can only be answered correctly if the LLM knows what email was already entered.
+        "email": cv_data.get("email", ""),
+        "phone": cv_data.get("phone", ""),
+        "location": cv_data.get("location", ""),
+        "summary": cv_data.get("summary", ""),
+        "skills": skills[:max_skills] if isinstance(skills, list) else skills,
+        "experience": lean_experience,
+        "education": lean_education,
+    }
+
+
+def _cover_letter_header(cv_data: dict) -> str:
+    """
+    Name / contact line / date block. Built deterministically in code rather
+    than asked of the LLM — contact details must be copied exactly (a model
+    can silently mangle a phone number or pick the wrong link), and "today's
+    date" is a fact the LLM has no reliable way to know, not something worth
+    risking a hallucination on.
+    """
+    name = str(cv_data.get("full_name") or "").strip()
+    phone = str(cv_data.get("phone") or "").strip()
+    email = str(cv_data.get("email") or "").strip()
+    location = str(cv_data.get("location") or "").strip()
+
+    links = cv_data.get("links", [])
+    linkedin_url = ""
+    if isinstance(links, list):
+        linkedin_url = next((str(l).strip() for l in links if "linkedin" in str(l).lower()), "")
+
+    contact_line = " | ".join(p for p in (phone, email, location, linkedin_url) if p)
+    date_line = datetime.now().strftime("%B %d, %Y")
+
+    return "\n".join(line for line in (name, contact_line, date_line) if line)
+
+
+def _assemble_cover_letter(cv_data: dict, body: str) -> str:
+    """Wrap an LLM-written (or template-written) body with the deterministic header/salutation/signature."""
+    name = str(cv_data.get("full_name") or "").strip() or "the candidate"
+    header = _cover_letter_header(cv_data)
+    body = (body or "").strip()
+    parts = [header, "Dear Hiring Manager,", body, "Sincerely,", name]
+    return "\n\n".join(p for p in parts if p)
+
+
+def _cover_letter_body_prompt(lean_cv: dict, job_desc_trimmed: str, max_words: int) -> str:
+    return f"""
+    Write ONLY the body paragraphs of a job-specific professional cover letter — no header, no
+    date, no "Dear Hiring Manager", no "Sincerely" or signature, those are added separately.
+    Base it strictly on the candidate CV JSON and this job description.
+
+    Structure (plain paragraphs, no markdown, no bullet points, no headings):
+    1. Opening paragraph — express interest in the specific role from the job description, and
+       give a one-sentence high-level value proposition (years of experience + domain fit).
+    2. One or two body paragraphs — describe concrete achievements from the candidate's actual
+       experience (real companies, titles, technologies, and metrics already present in the CV
+       JSON) and map them directly to what this job description is asking for.
+    3. Closing paragraph — reinforce fit and enthusiasm, and note availability to discuss further.
+
+    Non-negotiable rules:
+    - {max_words} words maximum.
+    - Every fact must come from the CANDIDATE CV JSON below — no fabricated companies, titles,
+      technologies, dates, or metrics. If the CV doesn't support a claim, don't make it.
+    - Do not include a salutation, header, date, or signature — start directly with the opening
+      paragraph's first sentence and end after the closing paragraph.
+    - Professional, direct tone. No generic filler ("I am a hard worker", "I am a team player").
 
     CANDIDATE CV JSON:
-    {json.dumps(cv_data, indent=2)}
+    {json.dumps(lean_cv, separators=(',', ':'))}
 
     JOB DESCRIPTION:
     {job_desc_trimmed}
 
-    Return ONLY the cover letter text. No preamble, no commentary.
+    Return ONLY the paragraphs of the letter body, separated by blank lines. No preamble, no
+    commentary, no markdown.
     """
 
-    try:
-        return call_groq_with_retry(
-            [{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_retries=6,
+
+def _deterministic_fallback_body(cv_data: dict, job_description: str) -> str:
+    """
+    Last-resort, no-LLM cover letter body — used only if every Groq attempt
+    (including the fallback model in retry_groq_call) fails outright. Still
+    built entirely from the candidate's real CV data, never a generic
+    unrelated placeholder, so a cover letter is always produced and uploaded
+    rather than silently skipped.
+    """
+    summary = str(cv_data.get("summary") or "").strip()
+    skills = cv_data.get("skills", [])
+    top_skills = ", ".join(str(s) for s in skills[:8]) if isinstance(skills, list) else ""
+    experience = cv_data.get("experience", [])
+    latest = experience[0] if isinstance(experience, list) and experience else {}
+    role = latest.get("role") or latest.get("title") or latest.get("job_title", "")
+    company = latest.get("company") or latest.get("organization", "")
+
+    paragraphs = []
+    opening = "I am writing to express my interest in this role."
+    if summary:
+        opening += f" {summary}"
+    paragraphs.append(opening)
+
+    if role or company:
+        where = f"{role or 'my current role'}{f' at {company}' if company else ''}"
+        paragraphs.append(
+            f"In my experience as {where}, I have built hands-on expertise with "
+            f"{top_skills or 'the core skills this role requires'}, which I believe maps "
+            "directly to what you are looking for in this position."
         )
+
+    paragraphs.append(
+        "I would welcome the opportunity to discuss how my experience can support your team's "
+        "goals. Thank you for considering my application."
+    )
+    return "\n\n".join(paragraphs)
+
+
+def generate_cover_letter(cv_data, job_description):
+    # Truncate to stay well within token limits. The CV side of this prompt is
+    # deliberately kept lean (see _lean_cv_for_prompt) so this richer job-description
+    # allowance and the fuller letter structure below don't blow the token budget.
+    job_desc_trimmed = (job_description or "")[:2600]
+    lean_cv = _lean_cv_for_prompt(cv_data, max_experience=3, max_bullets=4, max_skills=15)
+
+    try:
+        body = call_groq_with_retry(
+            [{"role": "user", "content": _cover_letter_body_prompt(lean_cv, job_desc_trimmed, max_words=380)}],
+            temperature=0.7,
+            max_retries=4,
+        )
+        return _assemble_cover_letter(cv_data, body)
     except Exception as e:
         print(f"Error generating cover letter: {e}")
-        # Fallback: a shorter prompt (fewer tokens = more likely to clear a rate
-        # limit), but still carrying enough CV + job specifics that the result
-        # reads as tailored rather than generic boilerplate.
+        # Fallback: a leaner CV context (fewer tokens = more likely to clear a rate
+        # limit), still real CV facts, shorter target length.
         try:
-            name = cv_data.get("full_name", "the candidate")
-            summary = cv_data.get("summary", "")
-            skills = cv_data.get("skills", [])
-            top_skills = ", ".join(str(s) for s in skills[:8]) if isinstance(skills, list) else ""
-            experience = cv_data.get("experience", [])
-            latest_role = ""
-            if isinstance(experience, list) and experience:
-                exp = experience[0]
-                role = exp.get("role") or exp.get("title") or exp.get("job_title", "")
-                company = exp.get("company") or exp.get("organization", "")
-                if role or company:
-                    latest_role = f"{role} at {company}".strip()
-            simple_prompt = f"""Write a job-specific professional cover letter (max 200 words) for {name}.
-Candidate summary: {summary}
-Key skills: {top_skills}
-Most recent role: {latest_role}
-Job description (may be partial):
-{job_desc_trimmed[:1800]}
-
-Rules: reference specifics from the job description, map them to the candidate's skills/experience above,
-no fabricated claims. Return only the cover letter text, no preamble."""
-            return call_groq_with_retry(
-                [{"role": "user", "content": simple_prompt}],
+            lean_cv_short = _lean_cv_for_prompt(cv_data, max_experience=1, max_bullets=2, max_skills=8)
+            body = call_groq_with_retry(
+                [{"role": "user", "content": _cover_letter_body_prompt(lean_cv_short, job_desc_trimmed[:1800], max_words=220)}],
                 temperature=0.7,
-                max_retries=4,
+                max_retries=3,
             )
+            return _assemble_cover_letter(cv_data, body)
         except Exception as e2:
-            print(f"Fallback cover letter also failed: {e2}")
-            return ""
+            print(f"Fallback cover letter generation also failed: {e2}")
+            # Never return an empty cover letter — a deterministic, CV-grounded
+            # template guarantees a real, system-generated letter always gets
+            # uploaded instead of the upload step being silently skipped.
+            return _assemble_cover_letter(cv_data, _deterministic_fallback_body(cv_data, job_description))
 
 
 def render_tailored_cv_latex(cv_data):

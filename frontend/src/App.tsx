@@ -10,7 +10,6 @@ import {
   Loader2,
   Play,
   Upload,
-  Download,
   SkipForward,
   FileText,
   Sparkles,
@@ -37,6 +36,8 @@ interface Job {
   status: string;
   salary?: string;
   cross_platform_match?: boolean;
+  apply_type?: 'easy_apply' | 'external' | 'unknown';
+  tailored_today?: boolean;
 }
 
 interface Summary {
@@ -47,6 +48,7 @@ interface Summary {
   last_scan_time?: string;
   groq_api_usage?: number;
   tailored?: number;
+  tailored_today?: number;
   ready?: number;
   submitted?: number;
   skipped?: number;
@@ -100,10 +102,9 @@ const App: React.FC = () => {
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   const [isGeneratingPreview, setIsGeneratingPreview] = useState(false);
   const [activeTab, setActiveTab] = useState<Tab>('overview');
-  const [overviewMode, setOverviewMode] = useState<'all' | 'unique' | 'crossmatch' | 'pipeline'>('unique');
+  const [overviewMode, setOverviewMode] = useState<'all' | 'unique' | 'crossmatch' | 'pipeline' | 'linkedin_easy_apply'>('unique');
   const [waitingForReviewCompletion, setWaitingForReviewCompletion] = useState(false);
   const [expandedAppliedJobId, setExpandedAppliedJobId] = useState<string | null>(null);
-  const [cvVersion, setCvVersion] = useState(0);
   const [showBlueAlert, setShowBlueAlert] = useState<string | null>(null);
   const [autoApplyChain, setAutoApplyChain] = useState<{
     active: boolean;
@@ -139,26 +140,6 @@ const App: React.FC = () => {
   const hasProfile = useMemo(() => {
     return Boolean(profile && typeof profile === 'object' && Object.keys(profile).length > 0);
   }, [profile]);
-
-  // Browsers can't render Word docs inline in an <iframe> — check the actual
-  // content-type of the uploaded CV so we can show a "download to view" card
-  // instead of a blank/broken preview for .doc/.docx uploads.
-  const [cvIsPdf, setCvIsPdf] = useState<boolean | null>(null);
-  useEffect(() => {
-    if (!hasProfile) {
-      setCvIsPdf(null);
-      return;
-    }
-    let cancelled = false;
-    axios.head(`${API_BASE}/cv/file?v=${cvVersion}`)
-      .then((res) => {
-        if (cancelled) return;
-        const contentType = String(res.headers['content-type'] || '').toLowerCase();
-        setCvIsPdf(contentType.includes('pdf'));
-      })
-      .catch(() => { if (!cancelled) setCvIsPdf(null); });
-    return () => { cancelled = true; };
-  }, [hasProfile, cvVersion]);
 
   const formatPST = (isoString?: string) => {
     if (!isoString) return 'Never';
@@ -258,29 +239,46 @@ const App: React.FC = () => {
       null;
   }, [selectedJobId, allJobs, jobs]);
 
+  const isLinkedInEasyApply = (j: Job) =>
+    String(j.source || '').toLowerCase() === 'linkedin' && j.apply_type === 'easy_apply';
+
+  const linkedInEasyApplyJobs = useMemo(
+    () => jobs.filter((j) => isLinkedInEasyApply(j) && (j.status || '').toLowerCase() === 'discovered'),
+    [jobs]
+  );
+
   const overviewJobs = useMemo(() => {
     let filtered = (overviewMode === 'all' ? allJobs : jobs);
 
-    if (overviewMode === 'pipeline') {
+    if (overviewMode === 'linkedin_easy_apply') {
+      // LinkedIn jobs confirmed (by an actual page visit) to use LinkedIn's own
+      // Easy Apply flow rather than an external company form — kept separate so
+      // the main Overview list only shows LinkedIn jobs with an external apply link.
+      filtered = linkedInEasyApplyJobs;
+    } else if (overviewMode === 'pipeline') {
       // In pipeline mode, show jobs that are tailored, ready, or skipped (a skipped job was
-      // still tailored — it just wasn't submitted — so it belongs in this list too).
-      filtered = allJobs.filter((j) => ['tailored', 'ready', 'skipped'].includes((j.status || '').toLowerCase()));
+      // still tailored — it just wasn't submitted — so it belongs in this list too). Scoped
+      // to jobs tailored today (PKT, matching the daily report's day boundary) — a job
+      // tailored on a previous day quietly drops off this live card the next day, but stays
+      // fully intact in the tracker and in that day's emailed report.
+      filtered = allJobs.filter((j) => ['tailored', 'ready', 'skipped'].includes((j.status || '').toLowerCase()) && j.tailored_today);
     } else if (overviewMode === 'crossmatch') {
       // Jobs found on more than one platform — the "Unique Jobs" card's own list.
       // Once a job is tailored (or further along) it moves to the Tailored Pipeline
       // card instead, so this stays discovered-only just like the main list below.
-      filtered = jobs.filter((j) => j.cross_platform_match && (j.status || '').toLowerCase() === 'discovered');
+      filtered = jobs.filter((j) => j.cross_platform_match && (j.status || '').toLowerCase() === 'discovered' && !isLinkedInEasyApply(j));
     } else {
       // The main Overview list is discovered-only — the moment a job is tailored it
-      // belongs exclusively in the Tailored Pipeline card, not here too.
-      filtered = filtered.filter((j) => (j.status || '').toLowerCase() === 'discovered');
+      // belongs exclusively in the Tailored Pipeline card, not here too. LinkedIn jobs
+      // confirmed as Easy Apply live in their own card instead of here.
+      filtered = filtered.filter((j) => (j.status || '').toLowerCase() === 'discovered' && !isLinkedInEasyApply(j));
     }
 
     return filtered.filter((job) =>
       job.job_title.toLowerCase().includes(searchTerm.toLowerCase()) ||
       job.company.toLowerCase().includes(searchTerm.toLowerCase())
     );
-  }, [overviewMode, allJobs, jobs, searchTerm]);
+  }, [overviewMode, allJobs, jobs, linkedInEasyApplyJobs, searchTerm]);
 
   const readyToApplyCount = Math.max((summary?.total_discovered || 0) - (summary?.total_deduplicated || 0), 0);
   const appliedCount = appliedJobs.length;
@@ -524,7 +522,6 @@ const App: React.FC = () => {
         setProfile(res.data.profile);
       }
       setTailoredPreview(null);
-      setCvVersion((v) => v + 1);
       // Also refresh all data to keep everything in sync
       await fetchData();
 
@@ -770,11 +767,19 @@ const App: React.FC = () => {
               </div>
 
               <div className={`stat-card border-warning-subtle cursor-pointer ${overviewMode === 'pipeline' ? 'active-pipeline' : ''}`} onClick={() => setOverviewMode('pipeline')}>
-                <div className="stat-label">Application Pipeline</div>
-                <div className="stat-value text-warning">{summary?.tailored || 0}</div>
+                <div className="stat-label">Application Pipeline (Today)</div>
+                <div className="stat-value text-warning">{summary?.tailored_today || 0}</div>
                 <div className="source-breakdown mt-2 text-sm text-muted">
-                  <p>Tailored & Ready: {summary?.tailored || 0}</p>
+                  <p>Tailored & Ready today: {summary?.tailored_today || 0}</p>
                   <p>Successfully Applied: {appliedCount}</p>
+                </div>
+              </div>
+
+              <div className={`stat-card cursor-pointer ${overviewMode === 'linkedin_easy_apply' ? 'active-unique' : ''}`} onClick={() => setOverviewMode('linkedin_easy_apply')}>
+                <div className="stat-label">LinkedIn Easy Apply</div>
+                <div className="stat-value">{linkedInEasyApplyJobs.length}</div>
+                <div className="source-breakdown mt-2 text-sm text-muted">
+                  <p>LinkedIn jobs confirmed to use LinkedIn's own Easy Apply flow</p>
                 </div>
               </div>
             </div>
@@ -785,16 +790,19 @@ const App: React.FC = () => {
                   <h3>
                     {overviewMode === 'all' ? 'All Discovered Jobs' :
                      overviewMode === 'crossmatch' ? 'Jobs Posted on Multiple Platforms' :
-                     overviewMode === 'unique' ? 'Available Jobs' : 'Tailored Pipeline'}
+                     overviewMode === 'linkedin_easy_apply' ? 'LinkedIn Easy Apply' :
+                     overviewMode === 'unique' ? 'Available Jobs' : "Today's Tailored Pipeline"}
                   </h3>
                   <p>
                     {overviewMode === 'all'
                       ? 'Showing every not-yet-tailored role from the latest scan.'
                       : overviewMode === 'crossmatch'
                       ? 'Roles found on more than one platform — shown once here under the preferred source.'
+                      : overviewMode === 'linkedin_easy_apply'
+                      ? "LinkedIn jobs that use LinkedIn's own Easy Apply flow instead of an external company form."
                       : overviewMode === 'unique'
-                      ? 'Showing discovered jobs only — once a job is tailored it moves to the Tailored Pipeline card.'
-                      : 'Showing jobs that are tailored, ready, or skipped — anything not yet submitted.'}
+                      ? 'Showing discovered jobs only — once a job is tailored it moves to the Tailored Pipeline card. LinkedIn jobs with Easy Apply are kept in their own card instead of here.'
+                      : "Jobs tailored, readied, or skipped today — this list resets each day at midnight PKT. Yesterday's jobs aren't lost, they're still in your daily email report."}
                   </p>
                 </div>
                 <span className="badge badge-warning">{overviewJobs.length} Jobs</span>
@@ -957,17 +965,10 @@ const App: React.FC = () => {
                   <div className="parallel-view mb-4">
                     <div className="view-card">
                       <h4>Uploaded CV</h4>
-                      {cvIsPdf === false ? (
-                        <div className="cv-preview-fallback">
-                          <FileText size={32} style={{ opacity: 0.5 }} />
-                          <p>Word documents can't be previewed inline in the browser — it was still read and parsed successfully (see the profile on the right).</p>
-                          <a href={`${API_BASE}/cv/file?v=${cvVersion}`} target="_blank" rel="noopener noreferrer" className="btn btn-outline btn-small">
-                            <Download size={14} /> Download to view
-                          </a>
-                        </div>
-                      ) : (
-                        <iframe src={`${API_BASE}/cv/file?v=${cvVersion}`} className="cv-iframe" title="Uploaded CV" />
-                      )}
+                      <div className="cv-preview-fallback">
+                        <FileText size={32} style={{ opacity: 0.5 }} />
+                        <p>CV uploaded and parsed successfully for {String(profile.full_name || 'this profile')} — see the extracted details on the right.</p>
+                      </div>
                     </div>
                     <div className="view-card">
                       <h4>Parsed Profile</h4>

@@ -31,12 +31,13 @@ from src.utils.cv_processor import process_cv
 from src.workflow.optimize import generate_cover_letter, render_tailored_cv_latex
 from src.workflow.apply import signal_review_complete
 from src.storage.tracker import (
-    get_tracker_summary, 
-    save_parsed_profile, 
+    get_tracker_summary,
+    save_parsed_profile,
     save_tailored_application,
     get_dashboard_stats,
+    is_tailored_today,
     JobStatus,
-    UPLOADS_DIR, 
+    UPLOADS_DIR,
     PROFILES_DIR,
     APPLICATIONS_DIR,
     DATA_DIR
@@ -150,12 +151,14 @@ async def get_jobs(mode: str = "unique"):
             
         # Merge with tracker status
         tracker = get_tracker_summary()
-        status_map = {a["job_id"]: a["status"] for a in tracker.get("applications", [])}
-        
+        apps_by_id = {a["job_id"]: a for a in tracker.get("applications", [])}
+
         for job in jobs:
             jid = str(job.get('id') or job.get('job_id'))
-            job["status"] = status_map.get(jid, JobStatus.DISCOVERED)
-            
+            entry = apps_by_id.get(jid)
+            job["status"] = entry["status"] if entry else JobStatus.DISCOVERED
+            job["tailored_today"] = bool(entry) and is_tailored_today(entry.get("created_at"))
+
         return jobs
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -246,9 +249,29 @@ def run_discovery_task():
         tee = _TeeWriter(sys.stdout, log_stream)
         with redirect_stdout(tee), redirect_stderr(tee):
             print(f"[{datetime.now().isoformat()}] Discovery task started")
-            run_discovery()
+            discovery_summary = run_discovery()
         discovery_status["last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        discovery_status["last_message"] = "Discovery complete"
+
+        warnings = (discovery_summary or {}).get("errors") or []
+        completion_message = (
+            f"Discovery complete — {len(warnings)} warning(s), see scan log below"
+            if warnings else "Discovery complete"
+        )
+
+        try:
+            from src.discovery.linkedin_classify import classify_linkedin_jobs
+
+            def _classify_progress(done: int, total: int):
+                discovery_status["last_message"] = f"Checking LinkedIn Easy Apply status: {done}/{total}"
+
+            discovery_status["last_message"] = "Checking LinkedIn jobs for Easy Apply..."
+            with redirect_stdout(tee), redirect_stderr(tee):
+                classify_linkedin_jobs(progress_callback=_classify_progress)
+        except Exception as classify_err:
+            # Non-fatal: a classification hiccup shouldn't hide an otherwise-successful scan.
+            print(f"[WARN] LinkedIn Easy Apply classification failed: {classify_err}")
+
+        discovery_status["last_message"] = completion_message
         from src.storage.tracker import save_last_scan_time
         save_last_scan_time()
     except Exception as e:

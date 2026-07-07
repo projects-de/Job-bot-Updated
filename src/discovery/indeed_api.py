@@ -1,5 +1,6 @@
 import hashlib
 import json
+import time
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 
@@ -70,41 +71,61 @@ def fetch_indeed_jobs_via_apify_api(options: Optional[Dict] = None) -> List[Dict
     """
     Fetch Indeed Data Engineering jobs via the Apify API.
     Uses the valig/indeed-jobs-scraper actor.
+
+    Indeed is far more aggressive than LinkedIn/Dice about blocking automated
+    scraping, so the actor can legitimately complete successfully (no
+    exception, no error status) but still return an empty dataset for a
+    single attempt if that run's request got blocked/rate-limited on Indeed's
+    side. A retry a few seconds later is usually enough to recover, so we
+    retry once on an empty (but non-erroring) result before giving up.
     """
     if options is None:
         options = {}
 
-    try:
-        run_input = {
-            "title": options.get("title", config.JOB_KEYWORDS),
-            "location": options.get("location", config.JOB_LOCATION),
-            "country": options.get("country", "us"),
-            "datePosted": options.get("datePosted", "1"), # Last 24 hours (Indeed internal value)
-            "limit": options.get("limit", 50),
-        }
+    run_input = {
+        "title": options.get("title", config.JOB_KEYWORDS),
+        "location": options.get("location", config.JOB_LOCATION),
+        "country": options.get("country", "us"),
+        "datePosted": options.get("datePosted", "1"), # Last 24 hours (Indeed internal value)
+        "limit": options.get("limit", 50),
+    }
 
-        log(f"Starting Indeed Apify actor ({INDEED_ACTOR_ID}) with input:")
-        log(json.dumps(run_input, indent=2))
+    log(f"Starting Indeed Apify actor ({INDEED_ACTOR_ID}) with input:")
+    log(json.dumps(run_input, indent=2))
 
-        run = client.actor(INDEED_ACTOR_ID).call(
-            run_input=run_input,
-            run_timeout=timedelta(seconds=config.APIFY_TIMEOUT_SECONDS),
-        )
+    max_attempts = 2
+    retry_wait_seconds = 10
+    last_problem = None
 
-        jobs = []
-        dataset_id = getattr(run, "default_dataset_id", None) or (run.get("defaultDatasetId") if isinstance(run, dict) else None)
-        if run and dataset_id:
-            log(f"Indeed Actor run completed. Dataset ID: {dataset_id}")
-            dataset_items = client.dataset(dataset_id).list_items().items
+    for attempt in range(1, max_attempts + 1):
+        try:
+            run = client.actor(INDEED_ACTOR_ID).call(
+                run_input=run_input,
+                run_timeout=timedelta(seconds=config.APIFY_TIMEOUT_SECONDS),
+            )
 
-            for item in dataset_items:
-                jobs.append(normalize_indeed_job(item))
-        else:
-            error("Indeed Actor run completed but no dataset was returned.")
+            dataset_id = getattr(run, "default_dataset_id", None) or (run.get("defaultDatasetId") if isinstance(run, dict) else None)
+            if not dataset_id:
+                last_problem = "actor run completed but no dataset was returned"
+                error(f"Indeed API fetch attempt {attempt}/{max_attempts}: {last_problem}")
+            else:
+                log(f"Indeed Actor run completed (attempt {attempt}/{max_attempts}). Dataset ID: {dataset_id}")
+                dataset_items = client.dataset(dataset_id).list_items().items
 
-        log(f"Indeed API fetch completed: {len(jobs)} jobs found")
-        return jobs
+                if dataset_items:
+                    jobs = [normalize_indeed_job(item) for item in dataset_items]
+                    log(f"Indeed API fetch completed: {len(jobs)} jobs found")
+                    return jobs
 
-    except Exception as err:
-        error(f"Indeed API fetch failed: {str(err)}")
-        return []
+                last_problem = "actor run succeeded but returned 0 jobs (likely blocked/rate-limited by Indeed for this attempt)"
+                log(f"Indeed API fetch attempt {attempt}/{max_attempts}: {last_problem}")
+        except Exception as err:
+            last_problem = str(err)
+            error(f"Indeed API fetch attempt {attempt}/{max_attempts} failed: {last_problem}")
+
+        if attempt < max_attempts:
+            log(f"Retrying Indeed fetch in {retry_wait_seconds}s...")
+            time.sleep(retry_wait_seconds)
+
+    error(f"Indeed API fetch failed after {max_attempts} attempts: {last_problem}")
+    return []

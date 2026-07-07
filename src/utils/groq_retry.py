@@ -51,33 +51,56 @@ def extract_retry_after_seconds(exc: Exception):
                 return float(raw)
             except ValueError:
                 pass
-    match = re.search(r"try again in ([\d.]+)s", str(exc), re.IGNORECASE)
+    # Groq formats wait times as either plain seconds ("12.3s") or, once past a
+    # minute, compound "1m5.664s" / "2h3m4s" — the plain-seconds-only pattern
+    # silently failed to match the compound form, so we'd under-wait and burn
+    # retries against a limit that hadn't cleared yet.
+    match = re.search(r"try again in (?:(\d+)h)?(?:(\d+)m)?([\d.]+)s", str(exc), re.IGNORECASE)
     if match:
-        return float(match.group(1)) + 0.5
+        hours = float(match.group(1)) if match.group(1) else 0.0
+        minutes = float(match.group(2)) if match.group(2) else 0.0
+        seconds = float(match.group(3)) if match.group(3) else 0.0
+        return hours * 3600 + minutes * 60 + seconds + 0.5
     return None
 
 
-def retry_groq_call(fn, max_retries: int = 5, base_delay: float = 2.0, rate_limit_base_delay: float = 8.0):
+def retry_groq_call(fn, max_retries: int = 5, base_delay: float = 2.0, rate_limit_base_delay: float = 6.0, fallback_fn=None):
     """
     Run `fn()` (a zero-arg callable that performs one Groq API call), retrying
     on failure. Rate-limit (429) errors get a longer, Retry-After-aware backoff
     than generic transient errors, since they need real cooldown time rather
-    than a quick retry.
+    than a quick retry. When Groq doesn't give an exact wait time, the fallback
+    schedule is capped rather than left to grow unbounded.
+
+    If `fallback_fn` is given, a rate limit on `fn` triggers an immediate
+    (no-wait) switch to `fallback_fn` instead of sleeping — this matters
+    because Groq's per-model limits include a *daily* token cap (TPD), not
+    just a per-minute one, and waiting out a near-exhausted daily cap can take
+    many minutes. A fallback model draws from its own separate quota, so it
+    clears the request right away instead of waiting on the primary model's
+    cooldown.
     """
     last_exc = None
+    current_fn = fn
+    switched = False
     for attempt in range(max_retries):
         _wait_for_pacing_slot()
         try:
-            return fn()
+            return current_fn()
         except Exception as e:
             last_exc = e
+            rate_limited = is_rate_limit_error(e)
+            if rate_limited and fallback_fn is not None and not switched:
+                print(f"[WARN] Groq rate limit (429) on primary model — switching to fallback model immediately: {e}")
+                current_fn = fallback_fn
+                switched = True
+                continue
             if attempt == max_retries - 1:
                 print(f"[ERR] Groq API failed after {max_retries} attempts: {e}")
                 raise
-            rate_limited = is_rate_limit_error(e)
             wait = extract_retry_after_seconds(e)
             if wait is None:
-                wait = rate_limit_base_delay * (attempt + 1) if rate_limited else base_delay * (2 ** attempt)
+                wait = min(rate_limit_base_delay * (attempt + 1), 20.0) if rate_limited else base_delay * (2 ** attempt)
             kind = "rate limit (429)" if rate_limited else "error"
             print(f"[WARN] Groq API {kind} (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {wait:.1f}s...")
             time.sleep(wait)

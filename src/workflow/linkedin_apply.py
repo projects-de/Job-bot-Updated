@@ -29,6 +29,7 @@ from selenium.webdriver.common.keys import Keys
 
 from src.config import CANDIDATE_EMAIL, GROQ_API_KEY
 from src.utils.groq_retry import retry_groq_call
+from src.workflow.optimize import _lean_cv_for_prompt
 
 
 # ── State ─────────────────────────────────────────────────────────────────────
@@ -418,16 +419,21 @@ def _llm_answer_fields(cv_data: dict, fields: list, modal_context: str) -> list:
             model="llama-3.3-70b-versatile",
             temperature=0,
         )
+        fallback_llm = ChatGroq(
+            api_key=GROQ_API_KEY,
+            model="llama-3.1-8b-instant",
+            temperature=0,
+        )
         prompt = f"""You are a job application assistant. A candidate is filling a LinkedIn Easy Apply form.
 
 CURRENT FORM STEP (what the user sees):
 {modal_context[:1200]}
 
 VISIBLE FORM FIELDS (unfilled):
-{json.dumps(fields, indent=2)}
+{json.dumps(fields, separators=(',', ':'))}
 
 CANDIDATE CV:
-{json.dumps(cv_data, indent=2)}
+{json.dumps(_lean_cv_for_prompt(cv_data), separators=(',', ':'))}
 
 TASK: Return the correct value for each field based ONLY on the candidate's CV.
 Rules:
@@ -435,6 +441,8 @@ Rules:
 - work authorization / eligibility -> "Yes"
 - "how did you hear" -> "LinkedIn"
 - salary / compensation -> leave empty ("")
+- "verify/confirm/re-enter email" -> repeat the exact "email" value from the CANDIDATE CV above
+- "verify/confirm/re-enter phone" -> repeat the exact "phone" value from the CANDIDATE CV above
 - open-text questions -> 1-2 sentences using CV evidence only, never fabricate
 - yes/no radio -> answer "yes" for standard eligibility questions
 - "notice period" / "when can you start" -> "Immediately" or "2 weeks"
@@ -443,7 +451,10 @@ Rules:
 Return a JSON array ONLY, no explanation:
 [{{"id": "field_id", "value": "answer"}}, ...]"""
 
-        response = retry_groq_call(lambda: llm.invoke([HumanMessage(content=prompt)]))
+        response = retry_groq_call(
+            lambda: llm.invoke([HumanMessage(content=prompt)]),
+            fallback_fn=lambda: fallback_llm.invoke([HumanMessage(content=prompt)]),
+        )
         text = response.content.strip()
         if "[" in text and "]" in text:
             text = text[text.find("["):text.rfind("]") + 1]
@@ -559,47 +570,51 @@ def node_wait_login(state: LinkedInState) -> dict:
     return {"result": "failed", "error": "Login timed out after 5 minutes"}
 
 
+# Module-level so both the live apply flow (below) and the discovery-time
+# LinkedIn Easy-Apply-vs-external classifier (src/discovery/linkedin_classify.py)
+# use the exact same detection logic instead of two copies that can drift apart.
+EASY_APPLY_SELECTORS = [
+    # LinkedIn currently renders the Easy Apply control as an <a>, not a <button>,
+    # identified reliably by its aria-label (class names are hashed/obfuscated per load).
+    "a[aria-label*='Easy Apply' i]",
+    "xpath://a[contains(@aria-label, 'Easy Apply')]",
+    "xpath://span[contains(text(), 'Easy Apply')]/ancestor::a",
+    # Older/alternate LinkedIn layouts render it as a <button> — kept as fallbacks.
+    "button.jobs-apply-button",
+    "button[aria-label*='Easy Apply' i]",
+    ".jobs-apply-button--top-card",
+    ".jobs-unified-top-card__content button.artdeco-button--primary",
+    "button[data-control-name='jobdetails_topcard_inapply']",
+    "xpath://button[contains(., 'Easy Apply')]",
+    "xpath://span[contains(text(), 'Easy Apply')]/ancestor::button",
+    "xpath://button[contains(@aria-label, 'Easy Apply')]",
+    "xpath://span[contains(text(), 'Easy Apply')]"
+]
+
+EXTERNAL_APPLY_SELECTORS = [
+    "a.jobs-apply-button",
+    "button[aria-label*='Apply' i]:not([aria-label*='Easy' i])",
+    "a[data-control-name='jobdetails_topcard_inapply']",
+    ".jobs-unified-top-card__content a.artdeco-button--primary",
+    "a[aria-label*='Apply' i]:not([aria-label*='Easy' i])",
+    "xpath://div[contains(@class, 'jobs-unified-top-card')]//a[contains(., 'Apply')]",
+    "xpath://div[contains(@class, 'jobs-unified-top-card')]//span[contains(text(), 'Apply')]/ancestor::a",
+    "xpath://div[contains(@class, 'jobs-unified-top-card')]//span[contains(text(), 'Apply')]/ancestor::button"
+]
+
+
 def node_click_easy_apply(state: LinkedInState) -> dict:
     driver = state["driver"]
     print("  [LinkedIn Agent] Running node_click_easy_apply...")
 
-    easy_apply_selectors = [
-        # LinkedIn currently renders the Easy Apply control as an <a>, not a <button>,
-        # identified reliably by its aria-label (class names are hashed/obfuscated per load).
-        "a[aria-label*='Easy Apply' i]",
-        "xpath://a[contains(@aria-label, 'Easy Apply')]",
-        "xpath://span[contains(text(), 'Easy Apply')]/ancestor::a",
-        # Older/alternate LinkedIn layouts render it as a <button> — kept as fallbacks.
-        "button.jobs-apply-button",
-        "button[aria-label*='Easy Apply' i]",
-        ".jobs-apply-button--top-card",
-        ".jobs-unified-top-card__content button.artdeco-button--primary",
-        "button[data-control-name='jobdetails_topcard_inapply']",
-        "xpath://button[contains(., 'Easy Apply')]",
-        "xpath://span[contains(text(), 'Easy Apply')]/ancestor::button",
-        "xpath://button[contains(@aria-label, 'Easy Apply')]",
-        "xpath://span[contains(text(), 'Easy Apply')]"
-    ]
-
-    clicked = _click(driver, easy_apply_selectors, "Easy Apply button", timeout=10)
+    clicked = _click(driver, EASY_APPLY_SELECTORS, "Easy Apply button", timeout=10)
 
     if not clicked:
         # Check if it's a regular (non-Easy-Apply) external link
-        external_selectors = [
-            "a.jobs-apply-button",
-            "button[aria-label*='Apply' i]:not([aria-label*='Easy' i])",
-            "a[data-control-name='jobdetails_topcard_inapply']",
-            ".jobs-unified-top-card__content a.artdeco-button--primary",
-            "a[aria-label*='Apply' i]:not([aria-label*='Easy' i])",
-            "xpath://div[contains(@class, 'jobs-unified-top-card')]//a[contains(., 'Apply')]",
-            "xpath://div[contains(@class, 'jobs-unified-top-card')]//span[contains(text(), 'Apply')]/ancestor::a",
-            "xpath://div[contains(@class, 'jobs-unified-top-card')]//span[contains(text(), 'Apply')]/ancestor::button"
-        ]
-        
-        el = _find(driver, external_selectors, timeout=4)
+        el = _find(driver, EXTERNAL_APPLY_SELECTORS, timeout=4)
         if el:
             print("  -> External apply button found (not Easy Apply) — clicking it to open portal!")
-            clicked_ext = _click(driver, external_selectors, "External Apply button", timeout=5)
+            clicked_ext = _click(driver, EXTERNAL_APPLY_SELECTORS, "External Apply button", timeout=5)
             if clicked_ext:
                 time.sleep(2)
                 return {"result": "external"}
