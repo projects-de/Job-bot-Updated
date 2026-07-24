@@ -117,6 +117,35 @@ def log_application(job_id: str, job_title: str, company: str, status: str, reas
         _write_tracker(data)
 
 
+def save_job_snapshot(job_id: str, job: dict):
+    """
+    Persists a job's key display fields (title, company, url, location,
+    source, posted_date) into its tracker entry so the dashboard can still
+    render it later even if a subsequent discovery scan's snapshot file no
+    longer includes this exact posting — confirmed live on a Booz Allen
+    Hamilton job that fell out of a later scan and became invisible on every
+    dashboard card despite being correctly tracked here (the "Application
+    Pipeline (Today)" card, like every other job card, only ever renders
+    jobs present in the latest scan's snapshot file). Call this right after
+    log_application() has created the entry, so it always finds one to
+    attach the snapshot to; a no-op otherwise.
+    """
+    with _lock:
+        data = _read_tracker()
+        apps = data.get("applications", [])
+        snapshot = {
+            k: job.get(k) for k in (
+                "job_title", "company", "url", "job_url", "location",
+                "source", "posted_date", "remote", "salary",
+            ) if job.get(k) is not None
+        }
+        for entry in apps:
+            if entry.get("job_id") == job_id:
+                entry["job_snapshot"] = snapshot
+                _write_tracker(data)
+                return
+
+
 def get_tracker_summary() -> dict:
     with _lock:
         return _read_tracker()

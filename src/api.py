@@ -3,7 +3,7 @@ import os
 import json
 from glob import glob
 from contextlib import redirect_stdout, redirect_stderr
-from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File
+from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Body
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Dict, Any
 from datetime import datetime
@@ -159,6 +159,35 @@ async def get_jobs(mode: str = "unique"):
             job["status"] = entry["status"] if entry else JobStatus.DISCOVERED
             job["tailored_today"] = bool(entry) and is_tailored_today(entry.get("created_at"))
 
+        # A job tracked here (tailored/applied/skipped/etc.) can fall out of
+        # a later scan's snapshot file entirely if it no longer resurfaces in
+        # search results — which used to make it silently vanish from every
+        # dashboard card, including "Application Pipeline (Today)", despite
+        # being correctly tracked. Reconstruct a minimal entry from its saved
+        # snapshot (written by save_job_snapshot() the moment it's first
+        # tailored) so it stays visible. Confirmed live on a Booz Allen
+        # Hamilton LinkedIn job that disappeared this way.
+        present_ids = {str(job.get('id') or job.get('job_id')) for job in jobs}
+        for jid, entry in apps_by_id.items():
+            if jid in present_ids:
+                continue
+            snapshot = entry.get("job_snapshot") or {}
+            jobs.append({
+                "id": jid,
+                "job_id": jid,
+                "job_title": entry.get("job_title", "Unknown Title"),
+                "company": entry.get("company", "Unknown Company"),
+                "status": entry.get("status", JobStatus.DISCOVERED),
+                "tailored_today": is_tailored_today(entry.get("created_at")),
+                "url": snapshot.get("url") or snapshot.get("job_url", ""),
+                "location": snapshot.get("location", ""),
+                "source": snapshot.get("source", ""),
+                "posted_date": snapshot.get("posted_date", ""),
+                "remote": snapshot.get("remote", False),
+                "salary": snapshot.get("salary"),
+                "description": "",
+            })
+
         return jobs
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -172,7 +201,7 @@ async def get_applied_jobs():
         job_index = _build_job_index()
 
         applied_jobs = []
-        terminal_statuses = (JobStatus.SUBMITTED, JobStatus.EXPIRED, JobStatus.SKIPPED)
+        terminal_statuses = (JobStatus.SUBMITTED, JobStatus.EXPIRED)
         for app_entry in applications:
             if app_entry.get("status") not in terminal_statuses:
                 continue
@@ -183,6 +212,7 @@ async def get_applied_jobs():
 
             job_details = job_index.get(job_id, {})
             tailored = _load_tailored_payload(job_id)
+            has_credentials = os.path.exists(os.path.join(APPLICATIONS_DIR, job_id, "account_credentials.txt"))
             applied_jobs.append(
                 {
                     "job_id": job_id,
@@ -197,6 +227,7 @@ async def get_applied_jobs():
                     "tailored_cv": tailored.get("cv"),
                     "tailored_cv_latex": tailored.get("cv_latex", ""),
                     "cover_letter": tailored.get("cover_letter"),
+                    "has_credentials": has_credentials,
                 }
             )
 
@@ -204,6 +235,25 @@ async def get_applied_jobs():
         return applied_jobs
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/jobs/{job_id}/credentials")
+async def download_credentials(job_id: str):
+    filename = os.path.join(APPLICATIONS_DIR, job_id, "account_credentials.txt")
+    if not os.path.exists(filename):
+        raise HTTPException(status_code=404, detail="No generated account credentials for this job")
+
+    from fastapi.responses import FileResponse
+    return FileResponse(
+        filename,
+        media_type="text/plain",
+        filename=f"{job_id}-account-credentials.txt",
+        content_disposition_type="attachment",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 @app.get("/stats")
 async def get_stats():
@@ -270,6 +320,12 @@ def run_discovery_task():
         except Exception as classify_err:
             # Non-fatal: a classification hiccup shouldn't hide an otherwise-successful scan.
             print(f"[WARN] LinkedIn Easy Apply classification failed: {classify_err}")
+
+        # Dice's Easy-Apply-vs-external classification pass is skipped now that Dice
+        # discovery is switched off (see discover.py) — classify_dice_jobs() is left
+        # untouched in src/discovery/dice_classify.py in case Dice is ever re-enabled.
+        # Built In has no equivalent native wizard to classify: every posting's
+        # apply_url already resolves straight to the employer's own external ATS.
 
         discovery_status["last_message"] = completion_message
         from src.storage.tracker import save_last_scan_time
@@ -435,7 +491,7 @@ def tailor_job(job_id: str):
 @app.get("/apply/status")
 async def get_apply_status():
     import time as _time
-    from src.workflow.apply import review_deadline_epoch, REVIEW_TIMEOUT_SECONDS
+    from src.workflow.apply import review_deadline_epoch, awaiting_review, REVIEW_TIMEOUT_SECONDS
 
     deadline = review_deadline_epoch["value"]
     seconds_remaining = max(0, round(deadline - _time.time())) if deadline else None
@@ -444,18 +500,67 @@ async def get_apply_status():
         **application_status,
         "review_timeout_seconds": REVIEW_TIMEOUT_SECONDS,
         "seconds_remaining": seconds_remaining,
+        "awaiting_review": awaiting_review["value"],
     }
 
+STEP_LOG_FILE = os.path.join(BASE_DIR, "data", "application_steps.log")
+
+@app.get("/apply/current-logs")
+async def get_current_apply_logs(limit: int = 25):
+    """
+    Tails data/application_steps.log for whichever job is currently being
+    processed — lets the dashboard show what the bot is actually doing while
+    a job is still being filled (before it reaches REVIEW REQUIRED), instead
+    of that phase being a black box only visible by reading the raw log
+    file. Mirrors the existing /discover/logs endpoint.
+    """
+    current_job = application_status.get("current_job") or {}
+    job_id = str(current_job.get("id") or "")
+    if not job_id or not os.path.exists(STEP_LOG_FILE):
+        return {"lines": []}
+
+    try:
+        with open(STEP_LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+            lines = [ln for ln in f.read().splitlines() if f"[Job: {job_id}]" in ln]
+    except Exception:
+        return {"lines": []}
+
+    return {"lines": lines[-max(1, min(limit, 200)):]}
+
+def _review_still_active(job_id: str | None) -> bool:
+    """
+    True if there's actually a job waiting on your Submit/Skip click right now.
+    Guards against a click landing after the job it was meant for has already
+    finished on its own (e.g. its browser closed) — confirmed live on a
+    BankUnited "Cloud Data Engineer II" job: the dashboard's 3-second status
+    poll left a stale review banner on screen for up to 3s after the backend
+    had already finalized that job, and a Skip/Submit click during that gap
+    had no active review loop left to act on. When a job_id is supplied, this
+    also catches the narrower case where the NEXT job in a bulk run has
+    already started by the time the click arrives.
+    """
+    if not application_status["running"]:
+        return False
+    if job_id:
+        current = application_status.get("current_job") or {}
+        if str(current.get("id") or "") != str(job_id):
+            return False
+    return True
+
 @app.post("/apply/review/complete")
-async def review_complete():
+async def review_complete(job_id: str | None = Body(None, embed=True)):
+    if not _review_still_active(job_id):
+        return {"message": "That job already finished — nothing to submit.", "active": False}
     signal_review_complete()
-    return {"message": "Review signal sent"}
+    return {"message": "Review signal sent", "active": True}
 
 @app.post("/apply/skip")
-async def apply_skip():
+async def apply_skip(job_id: str | None = Body(None, embed=True)):
     from src.workflow.apply import signal_skip
+    if not _review_still_active(job_id):
+        return {"message": "That job already finished — nothing to skip.", "active": False}
     signal_skip()
-    return {"message": "Skip signal sent"}
+    return {"message": "Skip signal sent", "active": True}
 
 @app.get("/apply/tracker")
 async def get_apply_tracker():

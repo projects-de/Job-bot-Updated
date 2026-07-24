@@ -1,5 +1,6 @@
 import os
 import time
+from src.utils.step_logger import log_step
 
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -58,7 +59,7 @@ class IndeedApplier:
         "input[value*='Submit' i][type='submit']",
     ]
 
-    def __init__(self, driver, cv_data: dict, cover_letter: str = "", cv_filepath: str = None):
+    def __init__(self, driver, cv_data: dict, cover_letter: str = "", cv_filepath: str = None, job_id: str = None):
         self.driver = driver
         self.cv = cv_data
         self.cover_letter = cover_letter
@@ -155,9 +156,17 @@ class IndeedApplier:
             if inputs:
                 inputs[0].send_keys(os.path.abspath(self.cv_filepath))
                 print("    [OK] Uploaded resume file")
+
+                if hasattr(self, "job_id") and self.job_id:
+
+                    log_step(self.job_id, "Indeed Agent", "    [OK] Uploaded resume file")
                 time.sleep(1.5)
         except Exception as e:
             print(f"    [WARN] Resume upload error: {e}")
+
+            if hasattr(self, "job_id") and self.job_id:
+
+                log_step(self.job_id, "Indeed Agent", f"    [WARN] Resume upload error: {e}")
 
     def _fill_cover_letter(self):
         if not self.cover_letter:
@@ -245,9 +254,25 @@ class IndeedApplier:
         print()
         print("=" * 62)
         print("  [WARN]  INDEED LOGIN REQUIRED")
+
+        if hasattr(self, "job_id") and self.job_id:
+
+            log_step(self.job_id, "Indeed Agent", "  [WARN]  INDEED LOGIN REQUIRED")
         print("  Please log in to Indeed in the Chrome window")
+
+        if hasattr(self, "job_id") and self.job_id:
+
+            log_step(self.job_id, "Indeed Agent", "  Please log in to Indeed in the Chrome window")
         print("  (Continue with Google OR Continue with email).")
+
+        if hasattr(self, "job_id") and self.job_id:
+
+            log_step(self.job_id, "Indeed Agent", "  (Continue with Google OR Continue with email).")
         print(f"  Waiting up to {timeout_seconds // 60} minutes for you to log in...")
+
+        if hasattr(self, "job_id") and self.job_id:
+
+            log_step(self.job_id, "Indeed Agent", f"  Waiting up to {timeout_seconds // 60} minutes for you to log in...")
         print("=" * 62)
         print()
 
@@ -259,12 +284,22 @@ class IndeedApplier:
                     url = self.driver.current_url.lower()
                     if 'indeed.com' in url:
                         print("  [OK] Login complete — continuing application...")
+
+                        if hasattr(self, "job_id") and self.job_id:
+
+                            log_step(self.job_id, "Indeed Agent", "  [OK] Login complete — continuing application...")
                         time.sleep(2)
                         return True
             except Exception:
                 pass
 
         print("  [ERR] Login wait timed out — leaving page open for human review")
+
+
+        if hasattr(self, "job_id") and self.job_id:
+
+
+            log_step(self.job_id, "Indeed Agent", "  [ERR] Login wait timed out — leaving page open for human review")
         return False
 
     # ------------------------------------------------------------------ navigation
@@ -288,6 +323,10 @@ class IndeedApplier:
             time.sleep(0.3)
             el.click()
             print(f"    [OK] Clicked {label}")
+
+            if hasattr(self, "job_id") and self.job_id:
+
+                log_step(self.job_id, "Indeed Agent", f"    [OK] Clicked {label}")
             time.sleep(2)
             return True
         except ElementClickInterceptedException:
@@ -310,8 +349,16 @@ class IndeedApplier:
         for step in range(1, max_steps + 1):
             print(f"  -> Indeed apply step {step}")
 
+            if hasattr(self, "job_id") and self.job_id:
+
+                log_step(self.job_id, "Indeed Agent", f"  -> Indeed apply step {step}")
+
             if self._on_review_page():
                 print("  [OK] Reached Review page — pausing for human review")
+
+                if hasattr(self, "job_id") and self.job_id:
+
+                    log_step(self.job_id, "Indeed Agent", "  [OK] Reached Review page — pausing for human review")
                 return True
 
             self._fill_current_step()
@@ -322,16 +369,31 @@ class IndeedApplier:
                 # Maybe we're already on review
                 if self._on_review_page():
                     print("  [OK] Reached Review page — pausing for human review")
+
+                    if hasattr(self, "job_id") and self.job_id:
+
+                        log_step(self.job_id, "Indeed Agent", "  [OK] Reached Review page — pausing for human review")
                     return True
                 print(f"  [WARN] Stuck on step {step} — leaving for human review")
+
+                if hasattr(self, "job_id") and self.job_id:
+
+                    log_step(self.job_id, "Indeed Agent", f"  [WARN] Stuck on step {step} — leaving for human review")
                 return False
 
         print("  [WARN] Max steps reached without finding Review page")
+
+
+        if hasattr(self, "job_id") and self.job_id:
+
+
+            log_step(self.job_id, "Indeed Agent", "  [WARN] Max steps reached without finding Review page")
         return False
 
     # ------------------------------------------------------------------ public
 
-    def run(self, job_url: str) -> str:
+    def run(self, job_url: str, job_id: str = None) -> str:
+        self.job_id = job_id
         """
         Drive the Indeed application from listing page to Review page.
 
@@ -341,6 +403,10 @@ class IndeedApplier:
             'failed'             — could not proceed
         """
         print(f"  [Indeed] Opening: {job_url}")
+
+        if hasattr(self, "job_id") and self.job_id:
+
+            log_step(self.job_id, "Indeed Agent", f"  [Indeed] Opening: {job_url}")
         self.driver.get(job_url)
         time.sleep(3)
 
@@ -354,13 +420,25 @@ class IndeedApplier:
                 self.driver.get(job_url)
                 time.sleep(3)
 
+        # Snapshot open tabs BEFORE clicking Apply — the button may open the company's
+        # site in a new tab, and this snapshot is the only way to later tell which
+        # handle is the new one (capturing it any later would already include the new
+        # tab, making that diff always come up empty).
+        handles_before_click = self.driver.window_handles
+
         # Click the Apply button on the listing page
         clicked = self._click(self._APPLY_BTN, "Apply button")
         if not clicked:
             print("  [WARN] Apply button not found — checking if already on an application page")
+
+            if hasattr(self, "job_id") and self.job_id:
+
+                log_step(self.job_id, "Indeed Agent", "  [WARN] Apply button not found — checking if already on an application page")
             if self._on_review_page():
                 return 'review_reached'
-            return 'external_redirect'
+            ext_agent = IndeedExternalApplier(self.driver, self.cv, self.cover_letter, self.cv_filepath, original_handles=handles_before_click)
+            ext_agent.run(job_id=self.job_id)
+            return 'handled_external'
 
         time.sleep(2)
 
@@ -372,13 +450,71 @@ class IndeedApplier:
             # Re-click Apply after login
             self.driver.get(job_url)
             time.sleep(3)
+            handles_before_click = self.driver.window_handles
             self._click(self._APPLY_BTN, "Apply button (after login)")
             time.sleep(2)
 
-        # If we were redirected off Indeed, it's an external application
-        if not _is_indeed_url(self.driver.current_url):
+        # If we were redirected off Indeed, it's an external application — either the
+        # current (still-focused) tab navigated away from indeed.com, or Apply opened
+        # a brand new tab (current tab's URL would still read as indeed.com in that
+        # case, so the tab-count check is needed too, not just the URL check).
+        redirected_same_tab = not _is_indeed_url(self.driver.current_url)
+        opened_new_tab = len(self.driver.window_handles) > len(handles_before_click)
+        if redirected_same_tab or opened_new_tab:
             print(f"  -> Redirected to external site: {self.driver.current_url}")
-            return 'external_redirect'
+
+            if hasattr(self, "job_id") and self.job_id:
+
+                log_step(self.job_id, "Indeed Agent", f"  -> Redirected to external site: {self.driver.current_url}")
+            ext_agent = IndeedExternalApplier(self.driver, self.cv, self.cover_letter, self.cv_filepath, original_handles=handles_before_click)
+            ext_agent.run(job_id=self.job_id)
+            return 'handled_external'
 
         success = self._navigate_to_review()
         return 'review_reached' if success else 'failed'
+
+
+class IndeedExternalApplier:
+    def __init__(self, driver, cv_data: dict, cover_letter: str = "", cv_filepath: str = None, original_handles=None):
+        from src.workflow.apply import SequentialApplier
+        self.driver = driver
+        self.cv_data = cv_data
+        self.cover_letter = cover_letter
+        self.cv_filepath = cv_filepath
+        self.inner = SequentialApplier(cv_data, lambda cv, desc: cover_letter)
+        self.inner.driver = self.driver
+        # Must be the tab list captured BEFORE the Apply button was clicked — capturing
+        # it here (in __init__, called after the click) would already include the new
+        # tab, making the "before vs after" diff below always find nothing and falsely
+        # report "no new tab", leaving the driver stuck on the old tab.
+        self.original_handles = original_handles if original_handles is not None else driver.window_handles
+
+    def run(self, job_id: str):
+        import time
+        from src.utils.step_logger import log_step
+        print("  [IndeedExternalApplier] Handling external redirect...")
+        if job_id:
+            log_step(job_id, "Indeed Agent", "Handling external redirect...")
+        
+        time.sleep(3.5)
+        new_handles = self.driver.window_handles
+        if len(new_handles) > len(self.original_handles):
+            new_tab = [h for h in new_handles if h not in self.original_handles][-1]
+            self.driver.switch_to.window(new_tab)
+            print("  Switched to new tab/window for external Indeed redirect.")
+            if job_id:
+                log_step(job_id, "Indeed Agent", "Switched to new tab/window for external Indeed redirect.")
+        else:
+            print("  No new tab detected, continuing in current tab.")
+            if job_id:
+                log_step(job_id, "Indeed Agent", "No new tab detected, continuing in current tab.")
+
+        # Safety net for the tab-closes-itself pattern _recover_dead_window()
+        # handles — confirmed live on LinkedIn external-redirect jobs (Snowflake
+        # Data Engineer, Amtrak): an intermediate redirector tab can open the
+        # real form in a further new tab and then close itself a moment later.
+        # Cheap no-op if the current tab is still fine.
+        self.inner._recover_dead_window()
+
+        self.inner.wait_for_cloudflare()
+        self.inner.fill_form(self.cv_data, self.cover_letter, self.cv_filepath, job_id=job_id)

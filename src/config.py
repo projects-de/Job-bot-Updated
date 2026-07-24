@@ -46,6 +46,19 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 DICE_ACTOR_ID = os.getenv("DICE_ACTOR_ID", "shahidirfan/Dice-Job-Scraper")
 
+# Kept as a separate token/client from APIFY_TOKEN above (even though it currently
+# holds the same value) so a future rotation of either one can't silently break
+# the other source's discovery.
+BUILTIN_APIFY_TOKEN = os.getenv("BUILTIN_APIFY_TOKEN") or APIFY_TOKEN
+BUILTIN_ACTOR_ID = os.getenv("BUILTIN_ACTOR_ID", "shahidirfan/BuiltIn-Jobs-Scraper")
+
+# Kept separate from the shared APIFY_TIMEOUT_SECONDS (120s, works fine for
+# LinkedIn/Indeed/Dice) — confirmed live that the Built In actor's own
+# collectDetails:true per-job scraping needs longer than 120s for a full
+# results_wanted:50 run and was hitting TIMED-OUT before returning any data.
+# 300s matches the actor's own default run budget on Apify's side.
+BUILTIN_APIFY_TIMEOUT_SECONDS = int(os.getenv("BUILTIN_APIFY_TIMEOUT_SECONDS", 300))
+
 # Daily job report email (sent once per day at 12:00 AM Pakistan Standard Time)
 REPORT_SMTP_EMAIL = os.getenv("REPORT_SMTP_EMAIL")
 REPORT_SMTP_APP_PASSWORD = os.getenv("REPORT_SMTP_APP_PASSWORD")

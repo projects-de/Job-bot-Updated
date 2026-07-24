@@ -1,6 +1,9 @@
 import json
 import os
+import re
 import time
+from urllib.parse import urlparse
+from src.utils.step_logger import log_step
 import threading
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -13,7 +16,7 @@ from langchain_core.messages import HumanMessage
 
 from src.config import USER_AGENT, CANDIDATE_EMAIL, GROQ_API_KEY
 from src.utils.groq_retry import retry_groq_call
-from src.storage.tracker import log_application, save_tailored_application, JobStatus, APPLICATIONS_DIR, UPLOADS_DIR
+from src.storage.tracker import log_application, save_tailored_application, save_job_snapshot, JobStatus, APPLICATIONS_DIR, UPLOADS_DIR
 from src.workflow.optimize import render_tailored_cv_latex, _lean_cv_for_prompt
 from src.workflow.indeed_apply import IndeedApplier, _is_indeed_url
 from src.workflow.linkedin_apply import run_linkedin_agent
@@ -71,6 +74,108 @@ DECLINE_TO_ANSWER_KEYWORDS = ("decline", "prefer not", "do not wish", "don't wis
 # the API layer can import and read it live without a getter function.
 review_deadline_epoch = {"value": None}
 
+# True only once a job has actually reached "REVIEW REQUIRED" — i.e. the
+# bot's own fill work (including any native agent's internal retry/wait
+# loops) is done and it's genuinely waiting on a Skip/Submit click. Distinct
+# from application_status["running"] (True the whole time a job is being
+# processed, including while the bot is still actively filling/retrying) —
+# confirmed live on a QTech US Inc job stuck for minutes inside Dice's own
+# retry loop: the dashboard's Skip/Submit banner and countdown were shown
+# and clickable the entire time even though nothing was listening for them
+# yet, which made a Skip click during that phase silently do nothing. The
+# API layer reads this the same way it already reads review_deadline_epoch.
+awaiting_review = {"value": False}
+
+
+class SkipRequested(Exception):
+    """
+    Raised from inside a native agent's own long-running wait loops (Dice's
+    or LinkedIn's _wait_for_human_to_advance_step/_wait_for_password_entry,
+    LinkedIn's node_wait_login) the moment skip_event is set, so a Skip click
+    takes effect immediately even while the bot is still stuck mid-fill —
+    not just once it reaches REVIEW REQUIRED. Explicitly caught in
+    apply_to_job() and handled exactly like a skip requested during the
+    normal review wait (SKIPPED status, tabs closed, back to overview) —
+    caught before the generic `except Exception` there, which would
+    otherwise mislabel it as a FAILED job.
+    """
+    pass
+
+
+class BrowserCrashed(Exception):
+    """
+    Raised when the entire ChromeDriver/browser process is gone — not just
+    one tab closed (that's the "no such window" case _recover_dead_window()
+    already handles by switching to a surviving tab). Confirmed live on a
+    Tata Consultancy Services job: every Selenium call started failing with
+    a connection-refused error (the local ChromeDriver HTTP server itself
+    was unreachable), and with nothing distinguishing this from an ordinary
+    per-selector error, the bot spent 11+ minutes blindly retrying one field
+    selector after another against a connection that could never come back.
+    Checked for via check_browser_alive() at the same points SkipRequested
+    is checked; caught in apply_to_job(), which relaunches a fresh browser
+    and retries the job once before giving up.
+    """
+    pass
+
+
+class BrowserClosedByUser(Exception):
+    """
+    Raised when the browser window is confirmed genuinely gone — zero window
+    handles left, but the ChromeDriver connection itself is still fine (see
+    BrowserCrashed for the separate whole-process-dead case) — while waiting
+    for you to manually complete a step the bot paused on because it
+    couldn't fill it itself.
+
+    Confirmed live this exact gap existed: the wait loops for that pause
+    (_wait_for_human_to_advance_step() in both linkedin_apply.py and
+    builtin_apply.py) only ever checked for the whole-process-dead case via
+    check_browser_alive() — never "the window itself is just gone" — so
+    when you closed the browser mid-manual-fill, one of two silent failures
+    followed depending on which file: linkedin_apply.py's version inferred
+    "you finished the step" from the page-read failing (its page-signature
+    and validation-error checks both fail safe to ""/[] on any error, which
+    looks identical to "the page changed and has no errors"), so it resumed
+    filling against a dead browser and eventually reached a false "form
+    fully filled" state that got marked Submitted despite nothing real ever
+    being filled or submitted. builtin_apply.py's version instead looped
+    forever with no way out, since its dead-tab recovery correctly returns
+    False when no tabs remain but nothing then broke out of the loop.
+
+    Deliberately NOT retried like BrowserCrashed — relaunching and refilling
+    from scratch would just hit the exact same "needs your help" wall again,
+    since nothing about the field the bot couldn't handle has changed.
+    Caught in apply_to_job() and treated as an honest "not submitted" stop —
+    same JobStatus.TAILORED / "User closed browser before submit" outcome
+    the review-wait loop already produces when the browser closes there, so
+    the job lands back in today's Application Pipeline either way.
+    """
+    pass
+
+
+_CONNECTION_LOST_SIGNATURES = (
+    "actively refused",
+    "failed to establish a new connection",
+    "no connection could be made",
+)
+
+
+def check_browser_alive(driver):
+    """
+    Distinguishes "the whole browser/ChromeDriver process is gone" from "one
+    tab closed" — the former can never be recovered by switching windows, so
+    it needs a completely different response (relaunch), not the existing
+    per-tab recovery logic. A cheap, low-cost driver call (just reading the
+    window handle list) is enough to surface the failure without adding
+    meaningful overhead to the loops that already call this every 2 seconds.
+    """
+    try:
+        driver.window_handles
+    except Exception as e:
+        msg = str(e).lower()
+        if any(sig in msg for sig in _CONNECTION_LOST_SIGNATURES):
+            raise BrowserCrashed(str(e))
+
 
 def _load_tailored_for_job(job_id):
     """Load the pre-generated tailored CV and cover letter for a job."""
@@ -100,6 +205,8 @@ def _build_plain_text_cv(cv_data):
         lines.append(" | ".join(contact_parts))
 
     links = cv_data.get("links", [])
+    if isinstance(links, dict):
+        links = [str(v) for v in links.values() if v]
     if isinstance(links, list) and links:
         lines.append(" | ".join(links))
 
@@ -221,10 +328,20 @@ def _get_latest_uploaded_resume():
 
 
 class SequentialApplier:
+    # Recycling the browser periodically during a long bulk-apply run reduces
+    # the accumulated resource/state pressure (leftover renderer processes,
+    # long-lived profile state) that likely contributes to the kind of full
+    # ChromeDriver-connection-lost crash confirmed live on a Tata Consultancy
+    # Services job — a fresh, clean session every so often is cheap insurance
+    # against that class of failure recurring.
+    RESTART_EVERY_N_JOBS = 15
+
     def __init__(self, cv_data, cover_letter_func):
         self.cv_data = cv_data
         self.cover_letter_func = cover_letter_func
         self.driver = None
+        self.current_job_id = None
+        self._jobs_since_restart = 0
 
     def init_browser(self):
         if not self.driver:
@@ -311,9 +428,17 @@ class SequentialApplier:
                         except Exception:
                             pass
                     print(f"  [OK] Filled field: '{selector}' -> '{value}'")
+
+                    if hasattr(self, "current_job_id") and self.current_job_id:
+
+                        log_step(self.current_job_id, "Generic Filler", f"  [OK] Filled field: '{selector}' -> '{value}'")
                     return True
         except Exception as e:
             print(f"  [DEBUG] Error filling selector '{selector}': {e}")
+
+            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                log_step(self.current_job_id, "Generic Filler", f"  [DEBUG] Error filling selector '{selector}': {e}")
         return False
 
     def _try_fill_any(self, selectors, value):
@@ -392,6 +517,10 @@ class SequentialApplier:
                 if elements:
                     elements[0].send_keys(os.path.abspath(filepath))
                     print(f"  [OK] Uploaded {kind} file via: {selector}")
+
+                    if hasattr(self, "current_job_id") and self.current_job_id:
+
+                        log_step(self.current_job_id, "Generic Filler", f"  [OK] Uploaded {kind} file via: {selector}")
                     self._mark_uploaded(elements[0])
                     time.sleep(1.5)  # let the dropzone's JS process/validate the upload before moving on
                     return True
@@ -410,6 +539,10 @@ class SequentialApplier:
                 if own_keyword in context and other_keyword not in context:
                     el.send_keys(os.path.abspath(filepath))
                     print(f"  [OK] Uploaded {kind} file via context-matched input (nearby text: '{own_keyword}')")
+
+                    if hasattr(self, "current_job_id") and self.current_job_id:
+
+                        log_step(self.current_job_id, "Generic Filler", f"  [OK] Uploaded {kind} file via context-matched input (nearby text: '{own_keyword}')")
                     self._mark_uploaded(el)
                     time.sleep(1.5)
                     return True
@@ -423,6 +556,10 @@ class SequentialApplier:
                             continue
                         el.send_keys(os.path.abspath(filepath))
                         print(f"  [OK] Uploaded {kind} file via: {selector}")
+
+                        if hasattr(self, "current_job_id") and self.current_job_id:
+
+                            log_step(self.current_job_id, "Generic Filler", f"  [OK] Uploaded {kind} file via: {selector}")
                         self._mark_uploaded(el)
                         time.sleep(1.5)
                         return True
@@ -438,13 +575,57 @@ class SequentialApplier:
             if all_file_inputs:
                 all_file_inputs[0].send_keys(os.path.abspath(filepath))
                 print(f"  [OK] Uploaded {kind} file via first unfilled file input")
+
+                if hasattr(self, "current_job_id") and self.current_job_id:
+
+                    log_step(self.current_job_id, "Generic Filler", f"  [OK] Uploaded {kind} file via first unfilled file input")
                 self._mark_uploaded(all_file_inputs[0])
                 time.sleep(1.5)
                 return True
 
         except Exception as e:
             print(f"  [WARN] File upload failed ({kind}): {e}")
+
+            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                log_step(self.current_job_id, "Generic Filler", f"  [WARN] File upload failed ({kind}): {e}")
         return False
+
+    def _recover_dead_window(self):
+        """
+        True if the driver was successfully switched to a live tab after its
+        current one was closed out from under it. Confirmed live on a
+        Randstad Digital job (via Dice) and mirrored here for Indeed's
+        external-redirect path (IndeedExternalApplier delegates to this
+        class): an intermediate redirector tab can open the REAL application
+        in a further new tab and then close itself a moment later — every
+        operation on the now-dead handle then fails with "no such window:
+        target window already closed", including the apply-button search and
+        every single field-fill selector, which cascaded into what looked
+        like the browser just closing mid-application. Returns False if the
+        current tab is still fine (nothing to recover) or if no tabs remain.
+        """
+        try:
+            self.driver.current_window_handle
+            return False
+        except Exception:
+            pass
+        try:
+            remaining = self.driver.window_handles
+        except Exception:
+            remaining = []
+        if not remaining:
+            return False
+        try:
+            self.driver.switch_to.window(remaining[-1])
+            print("  [OK] Previous tab closed itself — switched to the new active tab.")
+
+            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                log_step(self.current_job_id, "Generic Filler", "  [OK] Previous tab closed itself — switched to the new active tab.")
+            return True
+        except Exception:
+            return False
 
     def _click_initial_apply_button(self):
         """Locate and click the initial 'Apply' / 'Apply Now' button on an external site if the form is not visible yet."""
@@ -456,11 +637,21 @@ class SequentialApplier:
             )
             if any(el.is_displayed() for el in form_elements):
                 print("  Form fields already visible on landing. Skipping initial apply click.")
+
+                if hasattr(self, "current_job_id") and self.current_job_id:
+
+                    log_step(self.current_job_id, "Generic Filler", "  Form fields already visible on landing. Skipping initial apply click.")
                 return True
         except Exception:
             pass
 
         print("  Form fields not visible. Searching for initial 'Apply' / 'Apply Now' button on portal...")
+
+
+        if hasattr(self, "current_job_id") and self.current_job_id:
+
+
+            log_step(self.current_job_id, "Generic Filler", "  Form fields not visible. Searching for initial 'Apply' / 'Apply Now' button on portal...")
 
         # No "not Easy Apply" exclusion here — this only ever runs on a site's OWN
         # page for sources without a dedicated agent (e.g. Dice), or on the external
@@ -517,11 +708,25 @@ class SequentialApplier:
             try:
                 result = self.driver.execute_script(find_and_click_js) or {}
             except Exception as e:
+                error_str = str(e).lower()
+                if "no such window" in error_str or "target window already closed" in error_str:
+                    if self._recover_dead_window():
+                        time.sleep(1.0)
+                        continue
+                    break
                 print(f"  [DEBUG] Apply-button search script error: {e}")
+
+                if hasattr(self, "current_job_id") and self.current_job_id:
+
+                    log_step(self.current_job_id, "Generic Filler", f"  [DEBUG] Apply-button search script error: {e}")
                 result = {}
 
             if result.get("clicked"):
                 print(f"  [OK] Clicked initial apply button: '{result.get('text', '')}' (href='{result.get('href', '')}')")
+
+                if hasattr(self, "current_job_id") and self.current_job_id:
+
+                    log_step(self.current_job_id, "Generic Filler", f"  [OK] Clicked initial apply button: '{result.get('text', '')}' (href='{result.get('href', '')}')")
                 time.sleep(3.5)  # Wait for page or form container to render
                 self.wait_for_cloudflare()
                 return True
@@ -529,6 +734,12 @@ class SequentialApplier:
             time.sleep(0.4)
 
         print("  [WARN] No initial apply button found or clicked.")
+
+
+        if hasattr(self, "current_job_id") and self.current_job_id:
+
+
+            log_step(self.current_job_id, "Generic Filler", "  [WARN] No initial apply button found or clicked.")
         return False
 
     def _select_dropdown_by_text_variants(self, select_el, variants):
@@ -564,6 +775,23 @@ class SequentialApplier:
         name_parts = full_name.split() if full_name else []
         first_name = name_parts[0] if name_parts else ""
         last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
+
+        # Confirmed live on a Snowflake Data Engineer job and an Amtrak job
+        # (via LinkedIn's external-redirect path; the same tab-lifecycle
+        # pattern applies here for Indeed via IndeedExternalApplier): if the
+        # current tab closed itself out from under us (an intermediate
+        # redirector tab that opens the real form in a further new tab, then
+        # closes), every one of the dozens of selector attempts below would
+        # fail identically with "no such window: target window already
+        # closed" — a pure log-spam cascade that looked like the whole
+        # browser just died. Check once up front instead: recover to a live
+        # tab if possible, or skip this entire fill pass cleanly if nothing
+        # is left to recover to.
+        try:
+            self.driver.current_window_handle
+        except Exception:
+            if not self._recover_dead_window():
+                return 0
 
         filled_count = 0
 
@@ -665,6 +893,10 @@ class SequentialApplier:
                     if sel_el.is_displayed():
                         if self._select_dropdown_by_text_variants(sel_el, variants):
                             print(f"  [OK] State dropdown selected: {state_token}")
+
+                            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                                log_step(self.current_job_id, "Generic Filler", f"  [OK] State dropdown selected: {state_token}")
                             filled_count += 1
                         break
 
@@ -681,10 +913,16 @@ class SequentialApplier:
                             sel_el, ["United States", "United States of America", "USA", "US"]
                         ):
                             print("  [OK] Country dropdown selected: United States")
+
+                            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                                log_step(self.current_job_id, "Generic Filler", "  [OK] Country dropdown selected: United States")
                             filled_count += 1
                     break
 
         links = tailored_cv.get('links', [])
+        if isinstance(links, dict):
+            links = [str(v) for v in links.values() if v]
         if isinstance(links, list):
             for link in links:
                 l_lower = link.lower()
@@ -738,8 +976,16 @@ class SequentialApplier:
                     if el.is_displayed() and not el.is_selected():
                         self.driver.execute_script("arguments[0].click();", el)
                         print(f"  [OK] Clicked consent checkbox: {sel}")
+
+                        if hasattr(self, "current_job_id") and self.current_job_id:
+
+                            log_step(self.current_job_id, "Generic Filler", f"  [OK] Clicked consent checkbox: {sel}")
         except Exception as ce:
             print(f"  [WARN] Checkbox clicking error: {ce}")
+
+            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                log_step(self.current_job_id, "Generic Filler", f"  [WARN] Checkbox clicking error: {ce}")
 
     def _fill_known_dropdowns(self):
         """Rule-based auto-fill for the two dropdown questions we can always answer safely."""
@@ -768,6 +1014,10 @@ class SequentialApplier:
                         if opt_text.strip() in ("no", "false", "n"):
                             sel_obj.select_by_visible_text(opt.text)
                             print(f"  [OK] Sponsorship dropdown auto-filled: {opt.text}")
+
+                            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                                log_step(self.current_job_id, "Generic Filler", f"  [OK] Sponsorship dropdown auto-filled: {opt.text}")
                             break
                 elif is_auth:
                     for opt in sel_obj.options:
@@ -775,6 +1025,10 @@ class SequentialApplier:
                         if opt_text.strip() in ("yes", "true", "y"):
                             sel_obj.select_by_visible_text(opt.text)
                             print(f"  [OK] Work Auth dropdown auto-filled: {opt.text}")
+
+                            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                                log_step(self.current_job_id, "Generic Filler", f"  [OK] Work Auth dropdown auto-filled: {opt.text}")
                             break
                 elif is_relocate:
                     # Fixed personal-preference answer (not derivable from a CV) — set once,
@@ -784,6 +1038,10 @@ class SequentialApplier:
                         if opt_text.strip() in ("no", "false", "n"):
                             sel_obj.select_by_visible_text(opt.text)
                             print(f"  [OK] Relocation dropdown auto-filled: {opt.text}")
+
+                            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                                log_step(self.current_job_id, "Generic Filler", f"  [OK] Relocation dropdown auto-filled: {opt.text}")
                             break
                 elif is_gender:
                     # Never guess a gender — only act if a "decline to answer" style
@@ -794,9 +1052,17 @@ class SequentialApplier:
                         if any(k in opt_text for k in DECLINE_TO_ANSWER_KEYWORDS):
                             sel_obj.select_by_visible_text(opt.text)
                             print(f"  [OK] Gender/self-ID dropdown auto-filled: {opt.text}")
+
+                            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                                log_step(self.current_job_id, "Generic Filler", f"  [OK] Gender/self-ID dropdown auto-filled: {opt.text}")
                             break
         except Exception as se:
             print(f"  [WARN] Dropdown auto-filling error: {se}")
+
+            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                log_step(self.current_job_id, "Generic Filler", f"  [WARN] Dropdown auto-filling error: {se}")
 
     def _radio_label(self, el):
         gid = el.get_attribute("id") or ""
@@ -837,6 +1103,10 @@ class SequentialApplier:
                         if self._radio_label(g) == "no" and not g.is_selected():
                             self.driver.execute_script("arguments[0].click();", g)
                             print(f"  [OK] Relocation radio auto-filled ('{name}'): No")
+
+                            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                                log_step(self.current_job_id, "Generic Filler", f"  [OK] Relocation radio auto-filled ('{name}'): No")
                             break
                 elif "gender" in context or "sex" in context.split():
                     # Never guess a gender — only act if a "decline to answer" style
@@ -847,9 +1117,17 @@ class SequentialApplier:
                         if any(k in label for k in DECLINE_TO_ANSWER_KEYWORDS) and not g.is_selected():
                             self.driver.execute_script("arguments[0].click();", g)
                             print(f"  [OK] Gender/self-ID radio auto-filled ('{name}'): {label}")
+
+                            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                                log_step(self.current_job_id, "Generic Filler", f"  [OK] Gender/self-ID radio auto-filled ('{name}'): {label}")
                             break
         except Exception as e:
             print(f"  [WARN] Known radio-group auto-fill error: {e}")
+
+            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                log_step(self.current_job_id, "Generic Filler", f"  [WARN] Known radio-group auto-fill error: {e}")
 
     def _fill_date_inputs(self):
         """
@@ -867,8 +1145,16 @@ class SequentialApplier:
                     continue
                 self.driver.execute_script(_NATIVE_SET_VALUE_JS, el, today_iso)
                 print(f"  [OK] Date field filled with today's date: {today_iso}")
+
+                if hasattr(self, "current_job_id") and self.current_job_id:
+
+                    log_step(self.current_job_id, "Generic Filler", f"  [OK] Date field filled with today's date: {today_iso}")
         except Exception as e:
             print(f"  [WARN] Date field auto-fill error: {e}")
+
+            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                log_step(self.current_job_id, "Generic Filler", f"  [WARN] Date field auto-fill error: {e}")
 
     def _fill_range_sliders(self, default_percent="0"):
         """
@@ -884,8 +1170,16 @@ class SequentialApplier:
                     continue
                 self.driver.execute_script(_NATIVE_SET_VALUE_JS, el, str(default_percent))
                 print(f"  [OK] Range slider set to: {default_percent}")
+
+                if hasattr(self, "current_job_id") and self.current_job_id:
+
+                    log_step(self.current_job_id, "Generic Filler", f"  [OK] Range slider set to: {default_percent}")
         except Exception as e:
             print(f"  [WARN] Range slider auto-fill error: {e}")
+
+            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                log_step(self.current_job_id, "Generic Filler", f"  [WARN] Range slider auto-fill error: {e}")
 
     def _field_label(self, el):
         try:
@@ -1045,6 +1339,10 @@ Return a JSON array ONLY, no explanation, matching each field by "id" (or "name"
             return json.loads(text)
         except Exception as e:
             print(f"  [WARN] LLM form-answer error: {e}")
+
+            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                log_step(self.current_job_id, "Generic Filler", f"  [WARN] LLM form-answer error: {e}")
             return []
 
     def _apply_llm_field_answers(self, answers):
@@ -1072,6 +1370,10 @@ Return a JSON array ONLY, no explanation, matching each field by "id" (or "name"
                         try:
                             sel_obj.select_by_visible_text(val)
                             print(f"  [OK] LLM-filled dropdown '{fid or fname}' -> '{val}'")
+
+                            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                                log_step(self.current_job_id, "Generic Filler", f"  [OK] LLM-filled dropdown '{fid or fname}' -> '{val}'")
                         except Exception:
                             for opt in sel_obj.options:
                                 if opt.text.strip().lower() == val.strip().lower():
@@ -1081,6 +1383,10 @@ Return a JSON array ONLY, no explanation, matching each field by "id" (or "name"
                         if val.lower() == "check" and not el.is_selected():
                             self.driver.execute_script("arguments[0].click();", el)
                             print(f"  [OK] LLM-checked checkbox '{fid or fname}'")
+
+                            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                                log_step(self.current_job_id, "Generic Filler", f"  [OK] LLM-checked checkbox '{fid or fname}'")
                     else:
                         current = (el.get_attribute("value") or "").strip()
                         if not current:
@@ -1106,6 +1412,10 @@ Return a JSON array ONLY, no explanation, matching each field by "id" (or "name"
                                 except Exception:
                                     pass
                             print(f"  [OK] LLM-filled field '{fid or fname}' -> '{str(val)[:40]}'")
+
+                            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                                log_step(self.current_job_id, "Generic Filler", f"  [OK] LLM-filled field '{fid or fname}' -> '{str(val)[:40]}'")
                     continue
 
                 # Radio group: no single element id — find the option matching the answer text.
@@ -1123,6 +1433,10 @@ Return a JSON array ONLY, no explanation, matching each field by "id" (or "name"
                         if label.strip().lower() == val.strip().lower() and not r.is_selected():
                             self.driver.execute_script("arguments[0].click();", r)
                             print(f"  [OK] LLM-selected radio '{fname}' -> '{val}'")
+
+                            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                                log_step(self.current_job_id, "Generic Filler", f"  [OK] LLM-selected radio '{fname}' -> '{val}'")
                             break
             except Exception:
                 pass
@@ -1182,12 +1496,17 @@ Return a JSON array ONLY, no explanation, matching each field by "id" (or "name"
                     except Exception:
                         self.driver.execute_script("arguments[0].click();", el)
                     print(f"  [OK] Clicked continue/next: '{text}'")
+
+                    if hasattr(self, "current_job_id") and self.current_job_id:
+
+                        log_step(self.current_job_id, "Generic Filler", f"  [OK] Clicked continue/next: '{text}'")
                     return True
             except Exception:
                 pass
         return False
 
     def fill_form(self, tailored_cv, cover_letter, cv_filepath=None, job_id=None):
+        self.current_job_id = job_id
         """
         Fill an external application form. Handles multi-step wizards (e.g. Lensa,
         Workday, Greenhouse) by looping: fill whatever is visible on the current
@@ -1212,6 +1531,10 @@ Return a JSON array ONLY, no explanation, matching each field by "id" (or "name"
                     new_tab = [h for h in handles_after_click if h not in handles_before_click][-1]
                     self.driver.switch_to.window(new_tab)
                     print("  [OK] Switched to newly opened tab for the application form.")
+
+                    if hasattr(self, "current_job_id") and self.current_job_id:
+
+                        log_step(self.current_job_id, "Generic Filler", "  [OK] Switched to newly opened tab for the application form.")
                     self.wait_for_cloudflare()
 
             max_steps = 6
@@ -1262,14 +1585,26 @@ Return a JSON array ONLY, no explanation, matching each field by "id" (or "name"
                         self._apply_llm_field_answers(answers)
                         print(f"  [OK] LLM answered {len(answers)} additional field(s)")
 
+                        if hasattr(self, "current_job_id") and self.current_job_id:
+
+                            log_step(self.current_job_id, "Generic Filler", f"  [OK] LLM answered {len(answers)} additional field(s)")
+
                 if self._is_final_submit_step():
                     print("  [OK] Form fully filled — reached final submit step. Waiting for your review/submission.")
+
+                    if hasattr(self, "current_job_id") and self.current_job_id:
+
+                        log_step(self.current_job_id, "Generic Filler", "  [OK] Form fully filled — reached final submit step. Waiting for your review/submission.")
                     return True
 
                 text_before = self._page_signature()
                 clicked = self._click_continue_button()
                 if not clicked:
                     print("  [OK] No further Continue/Next button found — treating current step as final.")
+
+                    if hasattr(self, "current_job_id") and self.current_job_id:
+
+                        log_step(self.current_job_id, "Generic Filler", "  [OK] No further Continue/Next button found — treating current step as final.")
                     return True
 
                 time.sleep(1.8)
@@ -1282,23 +1617,45 @@ Return a JSON array ONLY, no explanation, matching each field by "id" (or "name"
 
                 if stuck_count >= 2:
                     print("  [WARN] Continue click had no visible effect after repeated attempts — leaving form for manual completion.")
+
+                    if hasattr(self, "current_job_id") and self.current_job_id:
+
+                        log_step(self.current_job_id, "Generic Filler", "  [WARN] Continue click had no visible effect after repeated attempts — leaving form for manual completion.")
                     return True
 
             print("  [WARN] Reached max auto-fill steps — leaving form for manual completion/review.")
+
+
+            if hasattr(self, "current_job_id") and self.current_job_id:
+
+
+                log_step(self.current_job_id, "Generic Filler", "  [WARN] Reached max auto-fill steps — leaving form for manual completion/review.")
             return True
         except Exception as e:
             print(f"Error during auto-fill: {e}")
+
+            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                log_step(self.current_job_id, "Generic Filler", f"Error during auto-fill: {e}")
             return False
 
     def wait_for_cloudflare(self):
         """Wait if a Cloudflare challenge is detected on the current page."""
         try:
             print("Checking for Cloudflare challenge...")
+
+            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                log_step(self.current_job_id, "Generic Filler", "Checking for Cloudflare challenge...")
             for i in range(30):
                 title = self.driver.title
                 cf_titles = ("Just a moment", "Attention Required", "Security check", "Cloudflare")
                 if any(t in title for t in cf_titles):
                     print(f"  Cloudflare detected (attempt {i+1}). Waiting for you to solve it...")
+
+                    if hasattr(self, "current_job_id") and self.current_job_id:
+
+                        log_step(self.current_job_id, "Generic Filler", f"  Cloudflare detected (attempt {i+1}). Waiting for you to solve it...")
                     if i in (5, 15):
                         self.driver.refresh()
                     time.sleep(2)
@@ -1309,14 +1666,26 @@ Return a JSON array ONLY, no explanation, matching each field by "id" (or "name"
                     )
                     if elements:
                         print(f"  Cloudflare element detected (attempt {i+1}). Waiting...")
+
+                        if hasattr(self, "current_job_id") and self.current_job_id:
+
+                            log_step(self.current_job_id, "Generic Filler", f"  Cloudflare element detected (attempt {i+1}). Waiting...")
                         if i in (5, 15):
                             self.driver.refresh()
                         time.sleep(2)
                     else:
                         return True
             print("  Cloudflare did not resolve within timeout.")
+
+            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                log_step(self.current_job_id, "Generic Filler", "  Cloudflare did not resolve within timeout.")
         except Exception as e:
             print(f"  Cloudflare check error: {e}")
+
+            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                log_step(self.current_job_id, "Generic Filler", f"  Cloudflare check error: {e}")
         return False
 
     def wait_for_cloudflare_on_url(self, url: str):
@@ -1326,7 +1695,35 @@ Return a JSON array ONLY, no explanation, matching each field by "id" (or "name"
         self.wait_for_cloudflare()
         time.sleep(1)
 
-    def apply_to_job(self, job):
+    def _close_extra_job_windows(self, original_handles):
+        """
+        Closes every browser tab/window opened during this job's application
+        flow, leaving only the original tab open — used when the user presses
+        Skip, per explicit request: a skipped job shouldn't leave stray
+        external-apply tabs open in the background. Closes ALL non-original
+        handles (not just the current one), since a job can leave more than
+        one extra tab behind. Safe to call even if the browser is already
+        partially/fully closed (e.g. it raced with the "browser closed"
+        detection in apply_to_job) — every window-handle operation here is
+        wrapped defensively so this never raises.
+        """
+        try:
+            for handle in self.driver.window_handles:
+                if handle not in original_handles:
+                    try:
+                        self.driver.switch_to.window(handle)
+                        self.driver.close()
+                    except Exception:
+                        pass
+            remaining = self.driver.window_handles
+            if remaining:
+                target = original_handles[0] if original_handles[0] in remaining else remaining[0]
+                self.driver.switch_to.window(target)
+        except Exception:
+            pass
+
+    def apply_to_job(self, job, _crash_retry=False):
+        self.current_job_id = str(job.get('id') or job.get('job_id'))
         job_id = str(job.get('id') or job.get('job_id'))
         job_title = job.get('job_title', 'Unknown Title')
         company = job.get('company', 'Unknown Company')
@@ -1338,6 +1735,10 @@ Return a JSON array ONLY, no explanation, matching each field by "id" (or "name"
         # work as well as the human review window as one continuous budget. This is
         # what the dashboard's countdown bar reads via /apply/status the whole time.
         review_deadline_epoch["value"] = time.time() + REVIEW_TIMEOUT_SECONDS
+        awaiting_review["value"] = False
+
+        review_event.clear()
+        skip_event.clear()
 
         if not job_url:
             log_application(job_id, job_title, company, JobStatus.FAILED, "Missing application URL")
@@ -1351,8 +1752,16 @@ Return a JSON array ONLY, no explanation, matching each field by "id" (or "name"
                 tailored_cv = tailored_data.get("cv", {})
                 cover_letter = tailored_data.get("cover_letter", "")
                 print(f"Using pre-generated tailored CV and cover letter for {job_title}")
+
+                if hasattr(self, "current_job_id") and self.current_job_id:
+
+                    log_step(self.current_job_id, "Generic Filler", f"Using pre-generated tailored CV and cover letter for {job_title}")
             else:
                 print(f"Generating cover letter for {job_title} at {company}...")
+
+                if hasattr(self, "current_job_id") and self.current_job_id:
+
+                    log_step(self.current_job_id, "Generic Filler", f"Generating cover letter for {job_title} at {company}...")
                 job_desc = job.get('description', '')
                 # CV is used as-is (no LLM rewriting) — only the cover letter is
                 # generated per job description, per explicit instruction to stop
@@ -1366,15 +1775,38 @@ Return a JSON array ONLY, no explanation, matching each field by "id" (or "name"
                 })
 
             log_application(job_id, job_title, company, JobStatus.TAILORED)
-            
+            save_job_snapshot(job_id, job)
+
             # Prioritize the originally uploaded high-quality PDF/DOCX resume
             original_resume_path = _get_latest_uploaded_resume()
             if original_resume_path:
                 cv_filepath = original_resume_path
                 print(f"Using high-quality original resume for upload: {os.path.basename(cv_filepath)}")
+
+                if hasattr(self, "current_job_id") and self.current_job_id:
+
+                    log_step(self.current_job_id, "Generic Filler", f"Using high-quality original resume for upload: {os.path.basename(cv_filepath)}")
             else:
                 cv_filepath = _generate_cv_text_file(tailored_cv, job_id)
                 print(f"Fallback to text tailored resume: {os.path.basename(cv_filepath)}")
+
+                if hasattr(self, "current_job_id") and self.current_job_id:
+
+                    log_step(self.current_job_id, "Generic Filler", f"Fallback to text tailored resume: {os.path.basename(cv_filepath)}")
+
+            self._jobs_since_restart += 1
+            if self._jobs_since_restart > self.RESTART_EVERY_N_JOBS and self.driver:
+                print(f"[INFO] Recycling browser session after {self.RESTART_EVERY_N_JOBS} applications...")
+
+                if hasattr(self, "current_job_id") and self.current_job_id:
+
+                    log_step(self.current_job_id, "Generic Filler", f"[INFO] Recycling browser session after {self.RESTART_EVERY_N_JOBS} applications...")
+                try:
+                    self.driver.quit()
+                except Exception:
+                    pass
+                self.driver = None
+                self._jobs_since_restart = 1
 
             self.init_browser()
             self.wait_for_cloudflare_on_url(job_url)
@@ -1386,73 +1818,138 @@ Return a JSON array ONLY, no explanation, matching each field by "id" (or "name"
             # ── Route by job source ───────────────────────────────────────────
             if job_source == 'linkedin' or 'linkedin.com' in job_url.lower():
                 print(f"[LinkedIn Agent] Starting LangGraph agent for: {job_title} at {company}")
+
+                if hasattr(self, "current_job_id") and self.current_job_id:
+
+                    log_step(self.current_job_id, "Generic Filler", f"[LinkedIn Agent] Starting LangGraph agent for: {job_title} at {company}")
                 result = run_linkedin_agent(
                     driver=self.driver,
                     job_url=job_url,
                     cv_data=tailored_cv,
                     cover_letter=cover_letter,
                     cv_filepath=cv_filepath,
+                    job_id=job_id,
                 )
-                if result == 'external':
-                    # LinkedIn job redirects to external site — wait and switch to newly opened tab if any
-                    print(f"[Generic Filler] LinkedIn external apply for: {job_title}")
-                    time.sleep(3.5)
-                    new_handles = self.driver.window_handles
-                    if len(new_handles) > len(original_handles):
-                        new_tab = [h for h in new_handles if h not in original_handles][-1]
-                        self.driver.switch_to.window(new_tab)
-                        print("  Switched to new tab/window for external application.")
-                    else:
-                        print("  No new tab detected, continuing in current tab.")
-                    
-                    self.wait_for_cloudflare()
-                    self.fill_form(tailored_cv, cover_letter, cv_filepath, job_id=job_id)
-                elif result == 'already_applied':
+                if result == 'already_applied':
                     log_application(job_id, job_title, company, JobStatus.SUBMITTED, "Already applied via LinkedIn")
                     review_deadline_epoch["value"] = None
                     return True
                 elif result == 'failed':
                     print(f"[LinkedIn Agent] Could not complete — leaving browser open for manual apply")
 
+                    if hasattr(self, "current_job_id") and self.current_job_id:
+
+                        log_step(self.current_job_id, "Generic Filler", f"[LinkedIn Agent] Could not complete — leaving browser open for manual apply")
+
             elif job_source == 'indeed' or _is_indeed_url(job_url):
                 print(f"[Indeed Agent] Starting for: {job_title} at {company}")
+
+                if hasattr(self, "current_job_id") and self.current_job_id:
+
+                    log_step(self.current_job_id, "Generic Filler", f"[Indeed Agent] Starting for: {job_title} at {company}")
                 agent = IndeedApplier(
                     driver=self.driver,
                     cv_data=tailored_cv,
                     cover_letter=cover_letter,
                     cv_filepath=cv_filepath,
+                    job_id=job_id,
                 )
-                result = agent.run(job_url)
-                if result == 'external_redirect':
-                    print(f"[Generic Filler] Indeed external apply for: {job_title}")
-                    time.sleep(3.5)
-                    new_handles = self.driver.window_handles
-                    if len(new_handles) > len(original_handles):
-                        new_tab = [h for h in new_handles if h not in original_handles][-1]
-                        self.driver.switch_to.window(new_tab)
-                        print("  Switched to new tab/window for external Indeed redirect.")
-                    else:
-                        print("  No new tab detected, continuing in current tab.")
-                    
-                    self.wait_for_cloudflare()
-                    self.fill_form(tailored_cv, cover_letter, cv_filepath, job_id=job_id)
-                elif result == 'failed':
+                result = agent.run(job_url, job_id=job_id)
+                if result == 'failed':
                     print(f"[Indeed Agent] Could not reach review page — leaving for human review")
+
+                    if hasattr(self, "current_job_id") and self.current_job_id:
+
+                        log_step(self.current_job_id, "Generic Filler", f"[Indeed Agent] Could not reach review page — leaving for human review")
+
+            elif job_source == 'dice' or 'dice.com' in job_url.lower():
+                # Dormant: Dice discovery is switched off (see discover.py), so no new
+                # jobs route here — kept in place only so an already-tracked Dice job
+                # already in the pipeline can still be applied to.
+                from src.workflow.dice_apply import DiceApplier
+                print(f"[Dice Agent] Starting for: {job_title} at {company}")
+
+                if hasattr(self, "current_job_id") and self.current_job_id:
+
+                    log_step(self.current_job_id, "Generic Filler", f"[Dice Agent] Starting for: {job_title} at {company}")
+                agent = DiceApplier(
+                    driver=self.driver,
+                    cv_data=tailored_cv,
+                    cover_letter=cover_letter,
+                    cv_filepath=cv_filepath,
+                    job_id=job_id,
+                )
+                agent.run(job_url, job_id=job_id)
+
+            elif job_source == 'builtin' or 'builtin.com' in job_url.lower():
+                from src.workflow.builtin_apply import BuiltInApplier
+                print(f"[BuiltIn Agent] Starting for: {job_title} at {company}")
+
+                if hasattr(self, "current_job_id") and self.current_job_id:
+
+                    log_step(self.current_job_id, "Generic Filler", f"[BuiltIn Agent] Starting for: {job_title} at {company}")
+                agent = BuiltInApplier(
+                    driver=self.driver,
+                    cv_data=tailored_cv,
+                    cover_letter=cover_letter,
+                    cv_filepath=cv_filepath,
+                    job_id=job_id,
+                )
+                agent.run(job_url, job_id=job_id, apply_url=job.get('apply_url'))
 
             else:
                 # Generic path: open URL and fill form directly
                 print(f"[Generic Filler] Filling form for: {job_title} at {company}")
+
+                if hasattr(self, "current_job_id") and self.current_job_id:
+
+                    log_step(self.current_job_id, "Generic Filler", f"[Generic Filler] Filling form for: {job_title} at {company}")
                 self.wait_for_cloudflare()
                 self.fill_form(tailored_cv, cover_letter, cv_filepath, job_id=job_id)
 
             log_application(job_id, job_title, company, JobStatus.READY)
 
             print(f"--- [Job {job_id}] REVIEW REQUIRED ---")
+
+
+            if hasattr(self, "current_job_id") and self.current_job_id:
+
+
+                log_step(self.current_job_id, "Generic Filler", f"--- [Job {job_id}] REVIEW REQUIRED ---")
             print(f"Role: {job_title} | Company: {company}")
+
+            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                log_step(self.current_job_id, "Generic Filler", f"Role: {job_title} | Company: {company}")
             print(f"Action: Review the form in the browser, then click 'Submit Done' in the dashboard.")
 
-            review_event.clear()
-            skip_event.clear()
+            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                log_step(self.current_job_id, "Generic Filler", f"Action: Review the form in the browser, then click 'Submit Done' in the dashboard.")
+
+            try:
+                js_banner = """
+                if (!document.getElementById('__jobbot_review_banner')) {
+                    var b = document.createElement('div');
+                    b.id = '__jobbot_review_banner';
+                    b.style.cssText = 'position:fixed;top:0;left:0;width:100%;background-color:#007aff;color:white;text-align:center;padding:12px;font-family:sans-serif;font-size:16px;font-weight:bold;z-index:999999;box-shadow:0 2px 10px rgba(0,0,0,0.2);';
+                    b.innerText = 'Bot paused — please review or complete the form manually, then click Submit Done in the dashboard.';
+                    document.body.appendChild(b);
+                }
+                """
+                self.driver.execute_script(js_banner)
+            except Exception:
+                pass
+
+            # Only now — with the form actually ready for you — does the
+            # dashboard switch from "bot is filling" to the Skip/Submit
+            # banner, and only now does the review clock start. Previously
+            # the same 180s budget set at the very top of this function had
+            # to cover the bot's own fill time too, so a job that struggled
+            # for a few minutes (like the QTech US Inc case) could already
+            # be down to 0:00 by the time a real review ever started.
+            awaiting_review["value"] = True
+            review_deadline_epoch["value"] = time.time() + REVIEW_TIMEOUT_SECONDS
 
             timed_out = False
 
@@ -1470,8 +1967,13 @@ Return a JSON array ONLY, no explanation, matching each field by "id" (or "name"
                             body_el = self.driver.find_element(By.TAG_NAME, "body")
                             if body_el and "no longer accepting applications" in body_el.text.lower():
                                 print(f"LinkedIn job expired for: {job_title}")
+
+                                if hasattr(self, "current_job_id") and self.current_job_id:
+
+                                    log_step(self.current_job_id, "Generic Filler", f"LinkedIn job expired for: {job_title}")
                                 log_application(job_id, job_title, company, JobStatus.EXPIRED, "No longer accepting applications")
                                 review_deadline_epoch["value"] = None
+                                awaiting_review["value"] = False
                                 try:
                                     self.driver.close()
                                     if self.driver.window_handles:
@@ -1485,19 +1987,74 @@ Return a JSON array ONLY, no explanation, matching each field by "id" (or "name"
                     # 2. Check for manual submission detection
                     is_submitted = False
 
-                    # URL change detection
-                    if any(word in current_url for word in ['success', 'thank', 'completed', 'submitted', 'post-apply']):
-                        is_submitted = True
-                    else:
+                    # URL change detection — match on the URL *path/query*
+                    # only (never the hostname), with word boundaries. Many
+                    # real ATS domains legitimately contain these words as
+                    # substrings (e.g. successfactors.com), which was
+                    # false-triggering "submitted" the instant the form
+                    # loaded, before the user had done anything.
+                    try:
+                        parsed_url = urlparse(current_url)
+                        url_path_and_query = (parsed_url.path + "?" + parsed_url.query).lower()
+                    except Exception:
+                        url_path_and_query = ""
+                    url_looks_like_confirmation = bool(re.search(
+                        r'\b(success|thank[-_]?you|completed|submitted|post-apply|confirmation)\b',
+                        url_path_and_query
+                    ))
+
+                    if url_looks_like_confirmation:
                         try:
-                            # JS event listener check
+                            body_text = self.driver.find_element(By.TAG_NAME, "body").text.lower()
+                        except Exception:
+                            body_text = ""
+                        # A matching URL alone isn't enough corroboration —
+                        # require the page content to actually confirm a
+                        # submission happened.
+                        if any(phrase in body_text for phrase in (
+                            "application has been submitted", "application was submitted",
+                            "successfully submitted", "thank you for applying",
+                            "thank you for your application", "application received",
+                            "your application is complete",
+                        )):
+                            is_submitted = True
+
+                    if not is_submitted:
+                        try:
+                            # JS event listener check — only counts a genuine
+                            # final-submit click (exact "Submit" / "Submit
+                            # Application" text), not any element that merely
+                            # contains the word "submit" (e.g. "Submit and
+                            # Continue" wizard buttons, "Resubmit", "Submit
+                            # availability"), since those fire mid-flow on
+                            # multi-step forms and were closing the review out
+                            # from under the user before the real submission.
+                            #
+                            # e.target is walked up to the nearest button-like
+                            # ancestor via closest() before reading its text —
+                            # confirmed live this was the actual reason Workday's
+                            # real Submit clicks were never detected: Workday
+                            # renders it as a <div role="button"> wrapping a
+                            # separate icon element and a text span (the same
+                            # pattern already confirmed on its "Save and
+                            # Continue" button), so a click landing on the icon
+                            # or padding instead of squarely on the text made
+                            # e.target some sub-element with no text at all,
+                            # and the regex never matched — verified with an
+                            # isolated fixture: the old check missed an icon-area
+                            # click 100% of the time, the closest()-based one
+                            # caught it every time. Simple <button>Submit</button>
+                            # ATS's (Greenhouse, Ashby, etc.) are unaffected
+                            # either way since closest() on a plain button just
+                            # returns itself.
                             js_detector = """
                             if (!window.__bot_detector_injected) {
                                 window.__bot_detector_injected = true;
                                 window.__bot_form_submitted = false;
                                 document.addEventListener('click', function(e) {
-                                    let t = (e.target.innerText || e.target.value || e.target.getAttribute('aria-label') || '').toLowerCase();
-                                    if (t.includes('submit')) {
+                                    let target = e.target.closest("button, [role='button'], input[type='submit'], input[type='button'], a") || e.target;
+                                    let t = (target.innerText || target.value || target.getAttribute('aria-label') || '').trim().toLowerCase();
+                                    if (/^(submit|submit application|submit your application)$/.test(t)) {
                                         window.__bot_form_submitted = true;
                                     }
                                 }, true);
@@ -1508,29 +2065,136 @@ Return a JSON array ONLY, no explanation, matching each field by "id" (or "name"
                             return window.__bot_form_submitted;
                             """
                             if self.driver.execute_script(js_detector):
-                                is_submitted = True
+                                # A submit-like click alone isn't proof the submission
+                                # actually went through — confirmed live on a Rhombus
+                                # Power / Greenhouse job: the form still had ~13
+                                # unanswered/invalid custom dropdown fields when the
+                                # click happened, Greenhouse's own client-side
+                                # validation blocked the real submission and showed
+                                # inline errors instead, but the click event itself
+                                # still fired — the old code trusted it immediately,
+                                # closed the browser, and wrongly marked the job
+                                # Submitted even though nothing was actually sent.
+                                # Now waits for the page to react, then requires no
+                                # visible validation-error indicators still on screen
+                                # before trusting it. If errors are still showing, the
+                                # click didn't actually go through — re-arm the
+                                # listener and keep waiting for a genuine one instead
+                                # of finalizing.
+                                print(f"Submit-like click detected for: {job_title} — verifying it actually went through...")
+
+                                if hasattr(self, "current_job_id") and self.current_job_id:
+
+                                    log_step(self.current_job_id, "Generic Filler", f"Submit-like click detected for: {job_title} — verifying it actually went through...")
+
+                                time.sleep(5)
+
+                                # Let a dead browser raise naturally here so it falls
+                                # through to the existing skip/submit-race-aware
+                                # "browser closed" handling in the except block below,
+                                # instead of this wait silently treating a browser that
+                                # died during it as a confirmed submission.
+                                self.driver.title
+
+                                submission_confirmed = True
+                                try:
+                                    error_check_js = """
+                                    var selectors = ["[aria-invalid='true']", ".error, .field-error, .has-error, .invalid-feedback, .is-invalid", "[class*='error' i]:not(script):not(style)"];
+                                    for (var s = 0; s < selectors.length; s++) {
+                                        var els = document.querySelectorAll(selectors[s]);
+                                        for (var i = 0; i < els.length; i++) {
+                                            var el = els[i];
+                                            var rect = el.getBoundingClientRect();
+                                            var visible = rect.width > 0 && rect.height > 0 && window.getComputedStyle(el).visibility !== 'hidden';
+                                            if (visible && (el.innerText || '').trim().length > 0) {
+                                                return true;
+                                            }
+                                        }
+                                    }
+                                    return false;
+                                    """
+                                    if self.driver.execute_script(error_check_js):
+                                        submission_confirmed = False
+                                except Exception:
+                                    pass
+
+                                if submission_confirmed:
+                                    is_submitted = True
+                                else:
+                                    print(f"Submit click did not actually go through for: {job_title} (validation errors still visible) — resuming wait.")
+
+                                    if hasattr(self, "current_job_id") and self.current_job_id:
+
+                                        log_step(self.current_job_id, "Generic Filler", f"Submit click did not actually go through for: {job_title} (validation errors still visible) — resuming wait.")
+                                    try:
+                                        self.driver.execute_script("window.__bot_form_submitted = false;")
+                                    except Exception:
+                                        pass
                         except Exception:
                             pass
 
                     if is_submitted:
                         print(f"Auto-detected submission for: {job_title}")
+
+                        if hasattr(self, "current_job_id") and self.current_job_id:
+
+                            log_step(self.current_job_id, "Generic Filler", f"Auto-detected submission for: {job_title}")
                         review_event.set()
                         break
 
                     # Standard check to ensure browser is still open
                     self.driver.title
                 except Exception as e:
-                    print(f"Browser closed for: {job_title}")
-                    log_application(job_id, job_title, company, JobStatus.TAILORED, "User closed browser before submit")
                     review_deadline_epoch["value"] = None
+                    awaiting_review["value"] = False
+                    # A Skip or Submit click can race with this check — if either
+                    # signal was already set by the time the browser became
+                    # unreachable, that's what actually happened, not "you closed
+                    # the browser without submitting." Confirmed live on a
+                    # BankUnited "Cloud Data Engineer II" job: the generic
+                    # "browser closed" branch below used to win this race
+                    # unconditionally, silently swallowing a genuine Skip click and
+                    # finalizing the job as TAILORED/"User closed browser" instead
+                    # of SKIPPED — so it never showed up in today's Application
+                    # Pipeline the way a real skip should. Checked here first so a
+                    # Skip/Submit that lands right as the browser check fails is
+                    # never lost.
+                    if skip_event.is_set():
+                        print(f"Skipped: {job_title}")
+
+                        if hasattr(self, "current_job_id") and self.current_job_id:
+
+                            log_step(self.current_job_id, "Generic Filler", f"Skipped: {job_title}")
+                        log_application(job_id, job_title, company, JobStatus.SKIPPED, "User skipped during review")
+                        self._close_extra_job_windows(original_handles)
+                        return False
+                    if review_event.is_set():
+                        print(f"[OK] Submitted: {job_title}")
+
+                        if hasattr(self, "current_job_id") and self.current_job_id:
+
+                            log_step(self.current_job_id, "Generic Filler", f"[OK] Submitted: {job_title}")
+                        log_application(job_id, job_title, company, JobStatus.SUBMITTED)
+                        return False
+                    print(f"Browser closed for: {job_title}")
+
+                    if hasattr(self, "current_job_id") and self.current_job_id:
+
+                        log_step(self.current_job_id, "Generic Filler", f"Browser closed for: {job_title}")
+                    log_application(job_id, job_title, company, JobStatus.TAILORED, "User closed browser before submit")
                     return False
                 time.sleep(1.5)
 
             review_deadline_epoch["value"] = None
+            awaiting_review["value"] = False
 
             if timed_out:
                 print(f"Review timed out after {REVIEW_TIMEOUT_SECONDS}s without submission: {job_title}")
-                log_application(job_id, job_title, company, JobStatus.TAILORED, f"Timed out after {REVIEW_TIMEOUT_SECONDS}s without submission")
+
+                if hasattr(self, "current_job_id") and self.current_job_id:
+
+                    log_step(self.current_job_id, "Generic Filler", f"Review timed out after {REVIEW_TIMEOUT_SECONDS}s without submission: {job_title}")
+                log_application(job_id, job_title, company, JobStatus.SKIPPED, f"Timed out after {REVIEW_TIMEOUT_SECONDS}s without submission")
                 try:
                     self.driver.quit()
                 except Exception:
@@ -1540,19 +2204,20 @@ Return a JSON array ONLY, no explanation, matching each field by "id" (or "name"
 
             if skip_event.is_set():
                 print(f"Skipped: {job_title}")
+
+                if hasattr(self, "current_job_id") and self.current_job_id:
+
+                    log_step(self.current_job_id, "Generic Filler", f"Skipped: {job_title}")
                 log_application(job_id, job_title, company, JobStatus.SKIPPED, "User skipped during review")
-                # Clean up secondary window handles and return to primary
-                try:
-                    current_handle = self.driver.current_window_handle
-                    if len(self.driver.window_handles) > 1 and current_handle != original_handles[0]:
-                        self.driver.close()
-                        self.driver.switch_to.window(original_handles[0])
-                except Exception:
-                    pass
+                self._close_extra_job_windows(original_handles)
                 return False
 
             log_application(job_id, job_title, company, JobStatus.SUBMITTED)
             print(f"[OK] Submitted: {job_title}")
+
+            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                log_step(self.current_job_id, "Generic Filler", f"[OK] Submitted: {job_title}")
 
             # Clean up: close secondary tabs and return to primary handle
             try:
@@ -1567,10 +2232,87 @@ Return a JSON array ONLY, no explanation, matching each field by "id" (or "name"
 
             return True
 
+        except SkipRequested:
+            # A Skip click while the bot was still stuck mid-fill (e.g. inside
+            # a native agent's own wait loop) — handled exactly like a skip
+            # requested during the normal review wait: SKIPPED status, tabs
+            # closed, back to overview. Must be caught here, before the
+            # generic `except Exception` below, which would otherwise
+            # mislabel this as a FAILED job.
+            print(f"Skipped (while bot was still working): {job_title}")
+
+            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                log_step(self.current_job_id, "Generic Filler", f"Skipped (while bot was still working): {job_title}")
+            log_application(job_id, job_title, company, JobStatus.SKIPPED, "User skipped while bot was still filling the form")
+            self._close_extra_job_windows(original_handles)
+            review_deadline_epoch["value"] = None
+            awaiting_review["value"] = False
+            return False
+
+        except BrowserClosedByUser:
+            # The browser window closed while the bot was waiting for you to
+            # manually complete a step it couldn't handle itself — see
+            # BrowserClosedByUser's docstring for the false-Submitted /
+            # infinite-hang bugs this replaces. Treated exactly like closing
+            # the browser during the final review step already is: an honest
+            # "not submitted" stop, not a retry, so it lands back in today's
+            # Application Pipeline for you to revisit.
+            print(f"Browser closed for: {job_title}")
+
+            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                log_step(self.current_job_id, "Generic Filler", f"Browser closed for: {job_title}")
+            log_application(job_id, job_title, company, JobStatus.TAILORED, "User closed browser before submit")
+            review_deadline_epoch["value"] = None
+            awaiting_review["value"] = False
+            return False
+
+        except BrowserCrashed as e:
+            # The entire browser/ChromeDriver process is gone — confirmed
+            # live on a Tata Consultancy Services job where every Selenium
+            # call started failing with a connection-refused error and the
+            # bot spent 11+ minutes blindly retrying selectors against a
+            # connection that could never come back. A dead tab is
+            # recoverable (existing _recover_dead_window() logic); a dead
+            # connection isn't, so this relaunches a completely fresh
+            # browser and retries the SAME job once from scratch before
+            # giving up — rather than requiring you to notice and restart
+            # everything by hand.
+            review_deadline_epoch["value"] = None
+            awaiting_review["value"] = False
+            try:
+                if self.driver:
+                    self.driver.quit()
+            except Exception:
+                pass
+            self.driver = None
+
+            if _crash_retry:
+                print(f"Browser crashed again while applying to {job_title} — giving up after one retry: {e}")
+
+                if hasattr(self, "current_job_id") and self.current_job_id:
+
+                    log_step(self.current_job_id, "Generic Filler", f"Browser crashed again while applying to {job_title} — giving up after one retry: {e}")
+                log_application(job_id, job_title, company, JobStatus.FAILED, f"Browser crashed twice — please retry manually: {e}")
+                return False
+
+            print(f"Browser crashed while applying to {job_title} — relaunching a fresh browser and retrying once: {e}")
+
+            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                log_step(self.current_job_id, "Generic Filler", f"Browser crashed while applying to {job_title} — relaunching a fresh browser and retrying once: {e}")
+            return self.apply_to_job(job, _crash_retry=True)
+
         except Exception as e:
             print(f"Failed to apply to {job_title}: {e}")
+
+            if hasattr(self, "current_job_id") and self.current_job_id:
+
+                log_step(self.current_job_id, "Generic Filler", f"Failed to apply to {job_title}: {e}")
             log_application(job_id, job_title, company, JobStatus.FAILED, str(e))
             review_deadline_epoch["value"] = None
+            awaiting_review["value"] = False
             return False
 
     def close(self):

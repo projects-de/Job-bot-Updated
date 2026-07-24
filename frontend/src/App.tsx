@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import axios from 'axios';
-import brandMark from './assets/brand-mark.svg';
+import brandMark from './assets/brand-mark.jpg';
 import {
   MapPin,
   Clock,
@@ -17,7 +17,8 @@ import {
   GraduationCap,
   Award,
   Code2,
-  Send
+  Send,
+  KeyRound
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
@@ -30,6 +31,7 @@ interface Job {
   company: string;
   location: string;
   remote: boolean;
+  is_remote_us?: boolean;
   posted_date: string;
   url: string;
   description: string;
@@ -63,6 +65,7 @@ interface AppStatus {
   error?: string;
   seconds_remaining?: number;
   review_timeout_seconds?: number;
+  awaiting_review?: boolean;
 }
 
 interface DiscoveryLogs {
@@ -82,6 +85,7 @@ interface AppliedJob {
   tailored_cv?: any;
   tailored_cv_latex?: string;
   cover_letter?: string;
+  has_credentials?: boolean;
 }
 
 type Tab = 'overview' | 'start' | 'applied';
@@ -102,8 +106,9 @@ const App: React.FC = () => {
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   const [isGeneratingPreview, setIsGeneratingPreview] = useState(false);
   const [activeTab, setActiveTab] = useState<Tab>('overview');
-  const [overviewMode, setOverviewMode] = useState<'all' | 'unique' | 'crossmatch' | 'pipeline' | 'linkedin_easy_apply'>('unique');
+  const [overviewMode, setOverviewMode] = useState<'all' | 'linkedin_external' | 'indeed' | 'builtin' | 'builtin_remote' | 'unique' | 'crossmatch' | 'pipeline' | 'linkedin_easy_apply'>('linkedin_external');
   const [waitingForReviewCompletion, setWaitingForReviewCompletion] = useState(false);
+  const [currentApplyLogs, setCurrentApplyLogs] = useState<string[]>([]);
   const [expandedAppliedJobId, setExpandedAppliedJobId] = useState<string | null>(null);
   const [showBlueAlert, setShowBlueAlert] = useState<string | null>(null);
   const [autoApplyChain, setAutoApplyChain] = useState<{
@@ -215,6 +220,28 @@ const App: React.FC = () => {
     prevAppRunningRef.current = appStatus.running;
   }, [appStatus.running]);
 
+  // While the bot is still actively filling a job (running, but not yet at
+  // "REVIEW REQUIRED"), poll its live step-log lines so this phase isn't a
+  // black box — previously the only way to see what the bot was doing (or
+  // stuck on) here was to read data/application_steps.log directly.
+  useEffect(() => {
+    if (!appStatus.running || appStatus.awaiting_review) {
+      setCurrentApplyLogs([]);
+      return;
+    }
+    const fetchLogs = async () => {
+      try {
+        const res = await axios.get(`${API_BASE}/apply/current-logs?limit=12&t=${Date.now()}`);
+        setCurrentApplyLogs(res.data?.lines || []);
+      } catch {
+        // Transient — next poll will retry.
+      }
+    };
+    fetchLogs();
+    const interval = setInterval(fetchLogs, 2000);
+    return () => clearInterval(interval);
+  }, [appStatus.running, appStatus.awaiting_review]);
+
   useEffect(() => {
     const loadTailoredForSelected = async () => {
       if (!selectedJobId) {
@@ -247,30 +274,66 @@ const App: React.FC = () => {
     [jobs]
   );
 
-  const overviewJobs = useMemo(() => {
-    let filtered = (overviewMode === 'all' ? allJobs : jobs);
+  const linkedInExternalJobs = useMemo(
+    () => jobs.filter((j) => String(j.source || '').toLowerCase() === 'linkedin' && !isLinkedInEasyApply(j) && (j.status || '').toLowerCase() === 'discovered'),
+    [jobs]
+  );
 
-    if (overviewMode === 'linkedin_easy_apply') {
-      // LinkedIn jobs confirmed (by an actual page visit) to use LinkedIn's own
-      // Easy Apply flow rather than an external company form — kept separate so
-      // the main Overview list only shows LinkedIn jobs with an external apply link.
+  const indeedJobs = useMemo(
+    () => jobs.filter((j) => String(j.source || '').toLowerCase() === 'indeed' && (j.status || '').toLowerCase() === 'discovered'),
+    [jobs]
+  );
+
+  // Built In splits into two mutually-exclusive cards: "Remote (US)" — backed
+  // by the is_remote_us field computed at scan time in builtin_api.py from
+  // Built In's own workplace_type_enum + applicant_location_requirements
+  // fields (not a display-side text guess) — and everything else (hybrid,
+  // in-office, or remote outside the US). builtInJobs excludes the remote-US
+  // ones so the two cards' counts never overlap/double-count.
+  const builtInRemoteJobs = useMemo(
+    () => jobs.filter((j) => String(j.source || '').toLowerCase() === 'builtin' && (j.status || '').toLowerCase() === 'discovered' && j.is_remote_us === true),
+    [jobs]
+  );
+
+  const builtInJobs = useMemo(
+    () => jobs.filter((j) => String(j.source || '').toLowerCase() === 'builtin' && (j.status || '').toLowerCase() === 'discovered' && j.is_remote_us !== true),
+    [jobs]
+  );
+
+  // Fetched/new/actioned breakdown for the two Built In cards above — built from
+  // allJobs (mode=all: today's latest raw per-source scan, status merged in by
+  // the backend) rather than jobs (mode=unique, which has already dropped
+  // cross-platform duplicates and would undercount "Fetched"). Explains why the
+  // visible card counts are usually much lower than the Apify actor's raw
+  // per-scan total: most of a day's Built In results are the same standing
+  // postings already tailored/applied/skipped in an earlier scan, so they no
+  // longer show up as "discovered".
+  const builtInSourceStats = useMemo(() => {
+    const builtinAll = allJobs.filter((j) => String(j.source || '').toLowerCase() === 'builtin');
+    const newToday = builtinAll.filter((j) => (j.status || '').toLowerCase() === 'discovered').length;
+    return { fetched: builtinAll.length, newToday, alreadyActioned: builtinAll.length - newToday };
+  }, [allJobs]);
+
+  const overviewJobs = useMemo(() => {
+    let filtered = jobs;
+
+    if (overviewMode === 'all') {
+      filtered = allJobs;
+    } else if (overviewMode === 'linkedin_easy_apply') {
       filtered = linkedInEasyApplyJobs;
+    } else if (overviewMode === 'linkedin_external') {
+      filtered = linkedInExternalJobs;
+    } else if (overviewMode === 'indeed') {
+      filtered = indeedJobs;
+    } else if (overviewMode === 'builtin') {
+      filtered = builtInJobs;
+    } else if (overviewMode === 'builtin_remote') {
+      filtered = builtInRemoteJobs;
     } else if (overviewMode === 'pipeline') {
-      // In pipeline mode, show jobs that are tailored, ready, or skipped (a skipped job was
-      // still tailored — it just wasn't submitted — so it belongs in this list too). Scoped
-      // to jobs tailored today (PKT, matching the daily report's day boundary) — a job
-      // tailored on a previous day quietly drops off this live card the next day, but stays
-      // fully intact in the tracker and in that day's emailed report.
       filtered = allJobs.filter((j) => ['tailored', 'ready', 'skipped'].includes((j.status || '').toLowerCase()) && j.tailored_today);
     } else if (overviewMode === 'crossmatch') {
-      // Jobs found on more than one platform — the "Unique Jobs" card's own list.
-      // Once a job is tailored (or further along) it moves to the Tailored Pipeline
-      // card instead, so this stays discovered-only just like the main list below.
       filtered = jobs.filter((j) => j.cross_platform_match && (j.status || '').toLowerCase() === 'discovered' && !isLinkedInEasyApply(j));
     } else {
-      // The main Overview list is discovered-only — the moment a job is tailored it
-      // belongs exclusively in the Tailored Pipeline card, not here too. LinkedIn jobs
-      // confirmed as Easy Apply live in their own card instead of here.
       filtered = filtered.filter((j) => (j.status || '').toLowerCase() === 'discovered' && !isLinkedInEasyApply(j));
     }
 
@@ -278,9 +341,18 @@ const App: React.FC = () => {
       job.job_title.toLowerCase().includes(searchTerm.toLowerCase()) ||
       job.company.toLowerCase().includes(searchTerm.toLowerCase())
     );
-  }, [overviewMode, allJobs, jobs, linkedInEasyApplyJobs, searchTerm]);
+  }, [overviewMode, allJobs, jobs, linkedInEasyApplyJobs, linkedInExternalJobs, indeedJobs, builtInJobs, builtInRemoteJobs, searchTerm]);
 
-  const readyToApplyCount = Math.max((summary?.total_discovered || 0) - (summary?.total_deduplicated || 0), 0);
+  // Switching cards should always show that card's full list — a search term
+  // left over from browsing a previous card would otherwise keep silently
+  // narrowing the next card's results too, while the stat-card number itself
+  // (computed without the search filter) stays showing the true total. That
+  // mismatch is exactly what made a "15 jobs" card only ever show 1 result.
+  const selectOverviewMode = (mode: typeof overviewMode) => {
+    setSearchTerm('');
+    setOverviewMode(mode);
+  };
+
   const appliedCount = appliedJobs.length;
 
   const handleStartDiscovery = async () => {
@@ -293,15 +365,7 @@ const App: React.FC = () => {
     }
   };
 
-  const handleSelectJobToApply = async (jobId: string) => {
-    // Manual mode: just select the job and take user to the Start tab.
-    // Do not clear CV automatically (Auto Apply chain depends on reusing the uploaded CV).
-    setSelectedJobId(jobId);
-    setTailoredPreview(null);
-    setActiveTab('start');
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-    await fetchData();
-  };
+  
 
   const tailorSelectedJob = async (jobId: string) => {
     setIsGeneratingPreview(true);
@@ -490,7 +554,16 @@ const App: React.FC = () => {
   const handleReviewComplete = async () => {
     try {
       setWaitingForReviewCompletion(true);
-      await axios.post(`${API_BASE}/apply/review/complete`);
+      const res = await axios.post(`${API_BASE}/apply/review/complete`, { job_id: appStatus.current_job?.id });
+      if (res.data?.active === false) {
+        // The job this click was meant for already finished on its own
+        // (e.g. its browser closed) before the click reached the backend —
+        // nothing left to submit. Refresh immediately instead of leaving
+        // the "Finishing application..." spinner up for the rest of the
+        // 3-second poll cycle.
+        await fetchData();
+        setWaitingForReviewCompletion(false);
+      }
     } catch (error) {
       console.error(error);
       setWaitingForReviewCompletion(false);
@@ -500,7 +573,13 @@ const App: React.FC = () => {
   const handleSkipApplication = async () => {
     try {
       setWaitingForReviewCompletion(true);
-      await axios.post(`${API_BASE}/apply/skip`);
+      const res = await axios.post(`${API_BASE}/apply/skip`, { job_id: appStatus.current_job?.id });
+      if (res.data?.active === false) {
+        // Same stale-click case as handleReviewComplete above — the job
+        // already finished before this Skip click landed.
+        await fetchData();
+        setWaitingForReviewCompletion(false);
+      }
     } catch (error) {
       console.error(error);
       setWaitingForReviewCompletion(false);
@@ -659,7 +738,7 @@ const App: React.FC = () => {
       transition={{ delay: index * 0.03 }}
     >
       <div className="card-top">
-        <span className="source-tag">{job.source}</span>
+        <span className="source-tag"><span className="text-gradient">{job.source}</span></span>
         <span className={`status-tag ${job.status}`}>{job.status}</span>
       </div>
       <div className="card-body">
@@ -689,11 +768,11 @@ const App: React.FC = () => {
     <div className="app-container">
       <header className="main-header">
         <div className="logo-section">
-          <motion.div className="logo-icon" animate={{ rotate: 360 }} transition={{ duration: 20, repeat: Infinity, ease: 'linear' }}>
+          <div className="logo-icon">
             <img src={brandMark} alt="" aria-hidden="true" />
-          </motion.div>
+          </div>
           <div>
-            <h1>Job Bot <span className="text-gradient">Pro</span></h1>
+            <h1><span className="text-gradient">Job Bot Pro</span></h1>
             <p>Automated Data Engineering Career Agent</p>
           </div>
           {summary?.groq_api_usage !== undefined && (
@@ -748,17 +827,51 @@ const App: React.FC = () => {
           <div className="tab-pane overview-pane">
             <h2 className="mb-4">System Overview</h2>
             <div className="metrics-grid">
-              <div className={`stat-card cursor-pointer ${overviewMode === 'all' ? 'active-all' : ''}`} onClick={() => setOverviewMode('all')}>
-                <div className="stat-label">Total Discovered</div>
+              <div className={`stat-card cursor-pointer ${overviewMode === 'all' ? 'active-all' : ''}`} onClick={() => selectOverviewMode('all')}>
+                <div className="stat-label">Total Jobs Scraped</div>
                 <div className="stat-value">{summary?.total_discovered || 0}</div>
                 <div className="source-breakdown mt-2 text-sm text-muted">
                   <div className="flex justify-between"><span>LinkedIn:</span> <span>{summary?.by_source?.LinkedIn || summary?.by_source?.linkedin || 0}</span></div>
                   <div className="flex justify-between"><span>Indeed:</span> <span>{summary?.by_source?.Indeed || summary?.by_source?.indeed || 0}</span></div>
-                  <div className="flex justify-between"><span>Dice:</span> <span>{summary?.by_source?.Dice || summary?.by_source?.dice || 0}</span></div>
+                  <div className="flex justify-between"><span>Built In:</span> <span>{summary?.by_source?.BuiltIn || summary?.by_source?.builtin || 0}</span></div>
                 </div>
               </div>
 
-              <div className={`stat-card border-success-subtle cursor-pointer ${overviewMode === 'crossmatch' ? 'active-unique' : ''}`} onClick={() => setOverviewMode('crossmatch')}>
+              <div className={`stat-card cursor-pointer ${overviewMode === 'linkedin_external' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('linkedin_external')}>
+                <div className="stat-label">LinkedIn External Jobs</div>
+                <div className="stat-value">{linkedInExternalJobs.length}</div>
+                <div className="source-breakdown mt-2 text-sm text-muted">
+                  <p>LinkedIn jobs requiring external application</p>
+                </div>
+              </div>
+
+              <div className={`stat-card cursor-pointer ${overviewMode === 'indeed' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('indeed')}>
+                <div className="stat-label">Indeed Jobs</div>
+                <div className="stat-value">{indeedJobs.length}</div>
+                <div className="source-breakdown mt-2 text-sm text-muted">
+                  <p>Jobs discovered on Indeed</p>
+                </div>
+              </div>
+
+              <div className={`stat-card cursor-pointer ${overviewMode === 'builtin_remote' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('builtin_remote')}>
+                <div className="stat-label">Built In Remote Jobs (US)</div>
+                <div className="stat-value">{builtInRemoteJobs.length}</div>
+                <div className="source-breakdown mt-2 text-sm text-muted">
+                  <p>Fully remote, US-based Built In jobs only</p>
+                  <p className="text-xs">Fetched: {builtInSourceStats.fetched} · New today: {builtInSourceStats.newToday} · Already actioned: {builtInSourceStats.alreadyActioned}</p>
+                </div>
+              </div>
+
+              <div className={`stat-card cursor-pointer ${overviewMode === 'builtin' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('builtin')}>
+                <div className="stat-label">Built In Jobs</div>
+                <div className="stat-value">{builtInJobs.length}</div>
+                <div className="source-breakdown mt-2 text-sm text-muted">
+                  <p>Hybrid, in-office, or non-US Built In jobs</p>
+                  <p className="text-xs">Fetched: {builtInSourceStats.fetched} · New today: {builtInSourceStats.newToday} · Already actioned: {builtInSourceStats.alreadyActioned}</p>
+                </div>
+              </div>
+
+              <div className={`stat-card border-success-subtle cursor-pointer ${overviewMode === 'crossmatch' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('crossmatch')}>
                 <div className="stat-label">Unique Jobs</div>
                 <div className="stat-value text-success">{summary?.cross_platform_duplicates || 0}</div>
                 <div className="source-breakdown mt-2 text-sm text-muted">
@@ -766,7 +879,7 @@ const App: React.FC = () => {
                 </div>
               </div>
 
-              <div className={`stat-card border-warning-subtle cursor-pointer ${overviewMode === 'pipeline' ? 'active-pipeline' : ''}`} onClick={() => setOverviewMode('pipeline')}>
+              <div className={`stat-card border-warning-subtle cursor-pointer ${overviewMode === 'pipeline' ? 'active-pipeline' : ''}`} onClick={() => selectOverviewMode('pipeline')}>
                 <div className="stat-label">Application Pipeline (Today)</div>
                 <div className="stat-value text-warning">{summary?.tailored_today || 0}</div>
                 <div className="source-breakdown mt-2 text-sm text-muted">
@@ -775,7 +888,7 @@ const App: React.FC = () => {
                 </div>
               </div>
 
-              <div className={`stat-card cursor-pointer ${overviewMode === 'linkedin_easy_apply' ? 'active-unique' : ''}`} onClick={() => setOverviewMode('linkedin_easy_apply')}>
+              <div className={`stat-card cursor-pointer ${overviewMode === 'linkedin_easy_apply' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('linkedin_easy_apply')}>
                 <div className="stat-label">LinkedIn Easy Apply</div>
                 <div className="stat-value">{linkedInEasyApplyJobs.length}</div>
                 <div className="source-breakdown mt-2 text-sm text-muted">
@@ -789,6 +902,10 @@ const App: React.FC = () => {
                 <div>
                   <h3>
                     {overviewMode === 'all' ? 'All Discovered Jobs' :
+                     overviewMode === 'linkedin_external' ? 'LinkedIn External Jobs' :
+                     overviewMode === 'indeed' ? 'Indeed Jobs' :
+                     overviewMode === 'builtin' ? 'Built In Jobs' :
+                     overviewMode === 'builtin_remote' ? 'Built In Remote Jobs (US)' :
                      overviewMode === 'crossmatch' ? 'Jobs Posted on Multiple Platforms' :
                      overviewMode === 'linkedin_easy_apply' ? 'LinkedIn Easy Apply' :
                      overviewMode === 'unique' ? 'Available Jobs' : "Today's Tailored Pipeline"}
@@ -796,6 +913,14 @@ const App: React.FC = () => {
                   <p>
                     {overviewMode === 'all'
                       ? 'Showing every not-yet-tailored role from the latest scan.'
+                      : overviewMode === 'linkedin_external'
+                      ? 'Showing LinkedIn jobs that require applying on an external company site.'
+                      : overviewMode === 'indeed'
+                      ? 'Showing jobs discovered from Indeed.'
+                      : overviewMode === 'builtin'
+                      ? 'Showing Built In jobs that are hybrid, in-office, or not US-based remote.'
+                      : overviewMode === 'builtin_remote'
+                      ? 'Showing only fully remote Built In jobs open to candidates based in the United States.'
                       : overviewMode === 'crossmatch'
                       ? 'Roles found on more than one platform — shown once here under the preferred source.'
                       : overviewMode === 'linkedin_easy_apply'
@@ -820,19 +945,18 @@ const App: React.FC = () => {
 
         {activeTab === 'applied' && (
           <div className="tab-pane applied-pane">
-            <h2 className="mb-4">Applied, Skipped &amp; Expired Jobs</h2>
+            <h2 className="mb-4">Applied &amp; Expired Jobs</h2>
             <div className="applied-jobs-list">
               {appliedJobs.length === 0 ? (
                 <div className="empty-state">
-                  <p>No submitted, skipped, or expired jobs yet.</p>
+                  <p>No submitted or expired jobs yet.</p>
                 </div>
               ) : (
                 appliedJobs.map((job) => {
                   const expanded = expandedAppliedJobId === job.job_id;
                   const isExpired = job.status === 'EXPIRED';
-                  const isSkipped = job.status === 'SKIPPED';
                   return (
-                    <div className={`applied-job-card ${isExpired ? 'border-danger-subtle' : ''} ${isSkipped ? 'border-warning-subtle' : ''}`} key={job.job_id}>
+                    <div className={`applied-job-card ${isExpired ? 'border-danger-subtle' : ''}`} key={job.job_id}>
                       <div className="applied-job-top">
                         <div>
                           <h4 className="job-title">{job.job_title}</h4>
@@ -842,16 +966,25 @@ const App: React.FC = () => {
                             {job.location && <span><MapPin size={14} /> {job.location}</span>}
                             {isExpired ? (
                               <span className="text-danger"><CheckCircle size={14} /> Expired: {job.submitted_at || 'Unknown'}</span>
-                            ) : isSkipped ? (
-                              <span className="text-warning"><SkipForward size={14} /> Skipped: {job.submitted_at || 'Unknown'}</span>
                             ) : (
                               job.submitted_at && <span className="text-success"><CheckCircle size={14} /> Submitted: {job.submitted_at}</span>
                             )}
                           </div>
                         </div>
-                        <button className="btn-small" onClick={() => setExpandedAppliedJobId(expanded ? null : job.job_id)}>
-                          {expanded ? 'Hide Details' : 'Show Details'}
-                        </button>
+                        <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'flex-start' }}>
+                          {job.has_credentials && (
+                            <a
+                              className="btn-small"
+                              href={`${API_BASE}/jobs/${job.job_id}/credentials`}
+                              title="This application required creating an account with a bot-generated password — download it so you can log in later."
+                            >
+                              <KeyRound size={14} /> Download Credentials
+                            </a>
+                          )}
+                          <button className="btn-small" onClick={() => setExpandedAppliedJobId(expanded ? null : job.job_id)}>
+                            {expanded ? 'Hide Details' : 'Show Details'}
+                          </button>
+                        </div>
                       </div>
                       {expanded && (
                         <div className="applied-job-details">
@@ -1039,8 +1172,36 @@ const App: React.FC = () => {
                       </motion.div>
                     )}
 
-                    {/* Review banner - form is open */}
-                    {appStatus.running && (
+                    {/* Bot is still actively filling the form. Submit doesn't make
+                        sense yet (there's no finished form to submit), but Skip is
+                        available and fully functional here too — the bot's own
+                        wait loops now check for a skip signal and bail out
+                        immediately, even mid-fill or mid-stuck, instead of Skip
+                        being a dead click until REVIEW REQUIRED is reached. */}
+                    {appStatus.running && !appStatus.awaiting_review && (
+                      <div className="review-banner">
+                        <div className="flex items-center gap-4">
+                          <Loader2 className="spin" size={24} style={{ color: 'var(--primary)' }} />
+                          <div>
+                            <strong>Bot is filling the form for {appStatus.current_job?.title}...</strong>
+                            <p>Please wait, or Skip if it's stuck.</p>
+                          </div>
+                        </div>
+                        {currentApplyLogs.length > 0 && (
+                          <div className="scan-log-window">
+                            {currentApplyLogs.map((line, i) => (
+                              <div key={`${i}-${line}`} className="scan-log-line">{line}</div>
+                            ))}
+                          </div>
+                        )}
+                        <div className="flex gap-2">
+                          <button className="btn btn-outline text-danger border-danger" onClick={handleSkipApplication}><SkipForward size={18} /> Skip</button>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Review banner - form is ready, waiting on Skip/Submit */}
+                    {appStatus.running && appStatus.awaiting_review && (
                       <div className="review-banner active">
                         <div className="flex items-center gap-4">
                           <div className="progress-circle">

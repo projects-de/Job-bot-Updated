@@ -6,6 +6,21 @@ from src.config import GROQ_API_KEY
 from src.utils.groq_retry import retry_groq_call
 
 
+def _normalize_links(cv_data):
+    """
+    cv_data["links"] is stored as a dict (e.g. {"LinkedIn": "linkedin.com/in/..."})
+    in the real profile JSON, but older code here assumed a list and silently
+    dropped every link when it got a dict instead. Normalize to a flat list of
+    strings so both shapes work.
+    """
+    links = cv_data.get("links", [])
+    if isinstance(links, dict):
+        return [str(v) for v in links.values() if v]
+    if isinstance(links, list):
+        return [str(v) for v in links if v]
+    return []
+
+
 def _latex_escape(value):
     if value is None:
         return ""
@@ -154,6 +169,9 @@ def _lean_cv_for_prompt(cv_data, max_experience=2, max_bullets=2, max_skills=10)
         "email": cv_data.get("email", ""),
         "phone": cv_data.get("phone", ""),
         "location": cv_data.get("location", ""),
+        # Included so a "LinkedIn/GitHub/Portfolio URL" form field gets answered
+        # with the real link instead of the model inventing a plausible-looking one.
+        "links": _normalize_links(cv_data),
         "summary": cv_data.get("summary", ""),
         "skills": skills[:max_skills] if isinstance(skills, list) else skills,
         "experience": lean_experience,
@@ -174,10 +192,8 @@ def _cover_letter_header(cv_data: dict) -> str:
     email = str(cv_data.get("email") or "").strip()
     location = str(cv_data.get("location") or "").strip()
 
-    links = cv_data.get("links", [])
-    linkedin_url = ""
-    if isinstance(links, list):
-        linkedin_url = next((str(l).strip() for l in links if "linkedin" in str(l).lower()), "")
+    links = _normalize_links(cv_data)
+    linkedin_url = next((l.strip() for l in links if "linkedin" in l.lower()), "")
 
     contact_line = " | ".join(p for p in (phone, email, location, linkedin_url) if p)
     date_line = datetime.now().strftime("%B %d, %Y")
@@ -304,9 +320,9 @@ def render_tailored_cv_latex(cv_data):
     phone = _latex_escape(cv_data.get("phone", "+XX-XXXXXXXXXX"))
     email = _latex_escape(cv_data.get("email", "your@email.com"))
 
-    links = cv_data.get("links", []) if isinstance(cv_data.get("links"), list) else []
-    linkedin_link = next((l for l in links if "linkedin" in str(l).lower()), "https://linkedin.com")
-    github_link = next((l for l in links if "github" in str(l).lower()), "https://github.com")
+    links = _normalize_links(cv_data)
+    linkedin_link = next((l for l in links if "linkedin" in l.lower()), "https://linkedin.com")
+    github_link = next((l for l in links if "github" in l.lower()), "https://github.com")
 
     summary = _latex_escape(cv_data.get("summary", "Professional summary tailored to this role."))
 
