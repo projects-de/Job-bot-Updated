@@ -32,6 +32,7 @@ interface Job {
   location: string;
   remote: boolean;
   is_remote_us?: boolean;
+  workplace_type_enum?: string;
   posted_date: string;
   url: string;
   description: string;
@@ -106,7 +107,7 @@ const App: React.FC = () => {
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   const [isGeneratingPreview, setIsGeneratingPreview] = useState(false);
   const [activeTab, setActiveTab] = useState<Tab>('overview');
-  const [overviewMode, setOverviewMode] = useState<'all' | 'linkedin_external' | 'indeed' | 'builtin' | 'builtin_remote' | 'unique' | 'crossmatch' | 'pipeline' | 'linkedin_easy_apply'>('linkedin_external');
+  const [overviewMode, setOverviewMode] = useState<'all' | 'linkedin_external' | 'linkedin_external_remote' | 'linkedin_external_hybrid' | 'linkedin_external_onsite' | 'indeed' | 'builtin' | 'builtin_remote' | 'unique' | 'crossmatch' | 'pipeline' | 'linkedin_easy_apply'>('linkedin_external');
   const [waitingForReviewCompletion, setWaitingForReviewCompletion] = useState(false);
   const [currentApplyLogs, setCurrentApplyLogs] = useState<string[]>([]);
   const [expandedAppliedJobId, setExpandedAppliedJobId] = useState<string | null>(null);
@@ -279,6 +280,21 @@ const App: React.FC = () => {
     [jobs]
   );
 
+  const linkedInExternalRemoteJobs = useMemo(
+    () => jobs.filter((j) => String(j.source || '').toLowerCase() === 'linkedin' && !isLinkedInEasyApply(j) && (j.status || '').toLowerCase() === 'discovered' && (j.workplace_type_enum || '').toUpperCase() === 'REMOTE'),
+    [jobs]
+  );
+
+  const linkedInExternalHybridJobs = useMemo(
+    () => jobs.filter((j) => String(j.source || '').toLowerCase() === 'linkedin' && !isLinkedInEasyApply(j) && (j.status || '').toLowerCase() === 'discovered' && (j.workplace_type_enum || '').toUpperCase() === 'HYBRID'),
+    [jobs]
+  );
+
+  const linkedInExternalOnsiteJobs = useMemo(
+    () => jobs.filter((j) => String(j.source || '').toLowerCase() === 'linkedin' && !isLinkedInEasyApply(j) && (j.status || '').toLowerCase() === 'discovered' && (j.workplace_type_enum || '').toUpperCase() === 'IN_OFFICE'),
+    [jobs]
+  );
+
   const indeedJobs = useMemo(
     () => jobs.filter((j) => String(j.source || '').toLowerCase() === 'indeed' && (j.status || '').toLowerCase() === 'discovered'),
     [jobs]
@@ -323,6 +339,12 @@ const App: React.FC = () => {
       filtered = linkedInEasyApplyJobs;
     } else if (overviewMode === 'linkedin_external') {
       filtered = linkedInExternalJobs;
+    } else if (overviewMode === 'linkedin_external_remote') {
+      filtered = linkedInExternalRemoteJobs;
+    } else if (overviewMode === 'linkedin_external_hybrid') {
+      filtered = linkedInExternalHybridJobs;
+    } else if (overviewMode === 'linkedin_external_onsite') {
+      filtered = linkedInExternalOnsiteJobs;
     } else if (overviewMode === 'indeed') {
       filtered = indeedJobs;
     } else if (overviewMode === 'builtin') {
@@ -341,7 +363,7 @@ const App: React.FC = () => {
       job.job_title.toLowerCase().includes(searchTerm.toLowerCase()) ||
       job.company.toLowerCase().includes(searchTerm.toLowerCase())
     );
-  }, [overviewMode, allJobs, jobs, linkedInEasyApplyJobs, linkedInExternalJobs, indeedJobs, builtInJobs, builtInRemoteJobs, searchTerm]);
+  }, [overviewMode, allJobs, jobs, linkedInEasyApplyJobs, linkedInExternalJobs, linkedInExternalRemoteJobs, linkedInExternalHybridJobs, linkedInExternalOnsiteJobs, indeedJobs, builtInJobs, builtInRemoteJobs, searchTerm]);
 
   // Switching cards should always show that card's full list — a search term
   // left over from browsing a previous card would otherwise keep silently
@@ -845,6 +867,30 @@ const App: React.FC = () => {
                 </div>
               </div>
 
+              <div className={`stat-card cursor-pointer ${overviewMode === 'linkedin_external_remote' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('linkedin_external_remote')}>
+                <div className="stat-label">LinkedIn External Remote</div>
+                <div className="stat-value">{linkedInExternalRemoteJobs.length}</div>
+                <div className="source-breakdown mt-2 text-sm text-muted">
+                  <p>LinkedIn external jobs marked as fully remote</p>
+                </div>
+              </div>
+
+              <div className={`stat-card cursor-pointer ${overviewMode === 'linkedin_external_hybrid' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('linkedin_external_hybrid')}>
+                <div className="stat-label">LinkedIn External Hybrid</div>
+                <div className="stat-value">{linkedInExternalHybridJobs.length}</div>
+                <div className="source-breakdown mt-2 text-sm text-muted">
+                  <p>LinkedIn external jobs with hybrid work arrangement</p>
+                </div>
+              </div>
+
+              <div className={`stat-card cursor-pointer ${overviewMode === 'linkedin_external_onsite' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('linkedin_external_onsite')}>
+                <div className="stat-label">LinkedIn External On-Site</div>
+                <div className="stat-value">{linkedInExternalOnsiteJobs.length}</div>
+                <div className="source-breakdown mt-2 text-sm text-muted">
+                  <p>LinkedIn external jobs requiring on-site presence</p>
+                </div>
+              </div>
+
               <div className={`stat-card cursor-pointer ${overviewMode === 'indeed' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('indeed')}>
                 <div className="stat-label">Indeed Jobs</div>
                 <div className="stat-value">{indeedJobs.length}</div>
@@ -903,6 +949,9 @@ const App: React.FC = () => {
                   <h3>
                     {overviewMode === 'all' ? 'All Discovered Jobs' :
                      overviewMode === 'linkedin_external' ? 'LinkedIn External Jobs' :
+                     overviewMode === 'linkedin_external_remote' ? 'LinkedIn External Remote Jobs' :
+                     overviewMode === 'linkedin_external_hybrid' ? 'LinkedIn External Hybrid Jobs' :
+                     overviewMode === 'linkedin_external_onsite' ? 'LinkedIn External On-Site Jobs' :
                      overviewMode === 'indeed' ? 'Indeed Jobs' :
                      overviewMode === 'builtin' ? 'Built In Jobs' :
                      overviewMode === 'builtin_remote' ? 'Built In Remote Jobs (US)' :
@@ -915,6 +964,12 @@ const App: React.FC = () => {
                       ? 'Showing every not-yet-tailored role from the latest scan.'
                       : overviewMode === 'linkedin_external'
                       ? 'Showing LinkedIn jobs that require applying on an external company site.'
+                      : overviewMode === 'linkedin_external_remote'
+                      ? 'Showing LinkedIn external jobs explicitly marked as fully remote.'
+                      : overviewMode === 'linkedin_external_hybrid'
+                      ? 'Showing LinkedIn external jobs with hybrid work arrangement.'
+                      : overviewMode === 'linkedin_external_onsite'
+                      ? 'Showing LinkedIn external jobs requiring on-site presence.'
                       : overviewMode === 'indeed'
                       ? 'Showing jobs discovered from Indeed.'
                       : overviewMode === 'builtin'

@@ -19,6 +19,26 @@ def stable_job_id(prefix: str, value: str) -> str:
     return f"{prefix}-{digest}"
 
 
+def _extract_workplace_type(description_html: str, title: str, location: str) -> str:
+    """
+    Extract workplace type (REMOTE, HYBRID, IN_OFFICE) from LinkedIn job description HTML.
+    Searches for explicit location type mentions, returns "" if not found.
+    """
+    if not description_html:
+        return ""
+
+    text = description_html.lower()
+
+    if re.search(r"\bhybrid\b", text):
+        return "HYBRID"
+    if re.search(r"\b(remote|fully remote|work remote|work from home)\b", text):
+        return "REMOTE"
+    if re.search(r"\b(on.?site|in.?office|office.?based)\b", text):
+        return "IN_OFFICE"
+
+    return ""
+
+
 def normalize_linkedin_job(item: Dict) -> Dict:
     """
     Normalize a raw LinkedIn job item from the Apify dataset
@@ -26,12 +46,10 @@ def normalize_linkedin_job(item: Dict) -> Dict:
     """
     title = item.get("title", "")
     location = item.get("location", "")
-    
-    is_remote = (
-        bool(re.search(r"remote", title, re.IGNORECASE)) or 
-        bool(re.search(r"remote", location, re.IGNORECASE)) or 
-        item.get("workplaceType") == "Remote"
-    )
+    description_html = item.get("descriptionHtml", "")
+
+    workplace_type_enum = _extract_workplace_type(description_html, title, location)
+    is_remote = workplace_type_enum == "REMOTE"
 
     return {
         "source": "LinkedIn",
@@ -41,12 +59,13 @@ def normalize_linkedin_job(item: Dict) -> Dict:
         "company_logo": item.get("companyLogo"),
         "location": location or "United States",
         "remote": is_remote,
+        "workplace_type_enum": workplace_type_enum,
         "posted_date": item.get("postedAt"),
         "scraped_at": item.get("scrapedAt", datetime.utcnow().isoformat()),
         "url": item.get("url"),
         "apply_url": item.get("applyUrl") or item.get("url"),
         "description": item.get("descriptionText", ""),
-        "description_html": item.get("descriptionHtml", ""),
+        "description_html": description_html,
         "requirements": None,
         "salary": item.get("salary"),
         "seniority_level": item.get("seniorityLevel"),
