@@ -33,6 +33,8 @@ interface Job {
   remote: boolean;
   is_remote_us?: boolean;
   workplace_type_enum?: string;
+  job_category?: 'data_engineering' | 'qa';
+  qa_region?: 'dubai' | 'europe' | string;
   posted_date: string;
   url: string;
   description: string;
@@ -89,8 +91,18 @@ interface AppliedJob {
   has_credentials?: boolean;
 }
 
-type Tab = 'overview' | 'start' | 'applied';
+type Tab = 'overview' | 'qa' | 'start' | 'applied';
 type AutoApplyPhase = 'idle' | 'await_cv' | 'await_cv_update' | 'tailoring' | 'countdown' | 'starting_bot';
+
+// How long Auto Apply waits on the "Start Application" screen for an updated CV
+// upload before proceeding with whatever CV is already on file. This length is
+// purely a UX setting, not a correctness guarantee — the isUploadingRef guard
+// in startAutoApplyChain below independently holds the countdown (and delays
+// the actual proceed call) for as long as an upload is genuinely in flight, so
+// shrinking this number can never cause the old stale-CV race (a 15s window
+// used to hit that race directly, before that guard existed). 60s is enough
+// time to open the file picker and select a file without feeling like a stall.
+const CV_UPDATE_WINDOW_SECONDS = 60;
 
 const App: React.FC = () => {
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -107,7 +119,7 @@ const App: React.FC = () => {
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   const [isGeneratingPreview, setIsGeneratingPreview] = useState(false);
   const [activeTab, setActiveTab] = useState<Tab>('overview');
-  const [overviewMode, setOverviewMode] = useState<'all' | 'linkedin_external' | 'linkedin_external_remote' | 'linkedin_external_hybrid' | 'linkedin_external_onsite' | 'indeed' | 'builtin' | 'builtin_remote' | 'unique' | 'crossmatch' | 'pipeline' | 'linkedin_easy_apply'>('linkedin_external');
+  const [overviewMode, setOverviewMode] = useState<'all' | 'linkedin_external' | 'linkedin_external_remote' | 'linkedin_external_hybrid' | 'linkedin_external_onsite' | 'indeed' | 'builtin' | 'builtin_remote' | 'unique' | 'crossmatch' | 'pipeline' | 'linkedin_easy_apply' | 'qa_dubai_linkedin_easy_apply' | 'qa_dubai_linkedin_external' | 'qa_dubai_linkedin_external_remote' | 'qa_dubai_linkedin_external_hybrid' | 'qa_dubai_linkedin_external_onsite' | 'qa_europe_linkedin_easy_apply' | 'qa_europe_linkedin_external' | 'qa_europe_linkedin_external_remote' | 'qa_europe_linkedin_external_hybrid' | 'qa_europe_linkedin_external_onsite' | 'qa_stepstone_external' | 'qa_stepstone_external_remote' | 'qa_stepstone_external_hybrid' | 'qa_stepstone_external_onsite'>('linkedin_external');
   const [waitingForReviewCompletion, setWaitingForReviewCompletion] = useState(false);
   const [currentApplyLogs, setCurrentApplyLogs] = useState<string[]>([]);
   const [expandedAppliedJobId, setExpandedAppliedJobId] = useState<string | null>(null);
@@ -120,12 +132,19 @@ const App: React.FC = () => {
     error?: string;
   }>({ active: false, jobId: null, phase: 'idle', countdown: 0 });
 
+  const [isUploading, setIsUploading] = useState(false);
+
   const autoApplyTimerRef = React.useRef<number | null>(null);
   const autoApplyStateRef = React.useRef(autoApplyChain);
+  const isUploadingRef = React.useRef(isUploading);
 
   useEffect(() => {
     autoApplyStateRef.current = autoApplyChain;
   }, [autoApplyChain]);
+
+  useEffect(() => {
+    isUploadingRef.current = isUploading;
+  }, [isUploading]);
 
   const clearAutoApplyTimer = () => {
     if (autoApplyTimerRef.current) {
@@ -270,28 +289,124 @@ const App: React.FC = () => {
   const isLinkedInEasyApply = (j: Job) =>
     String(j.source || '').toLowerCase() === 'linkedin' && j.apply_type === 'easy_apply';
 
+  // Jobs missing job_category entirely are from before the QA search pass
+  // existed — treated as data_engineering so old data keeps showing up in the
+  // existing (now implicitly "Data Engineering") cards with no migration needed.
+  const isQaJob = (j: Job) => j.job_category === 'qa';
+  const isLinkedIn = (j: Job) => String(j.source || '').toLowerCase() === 'linkedin';
+  const isStepStone = (j: Job) => String(j.source || '').toLowerCase() === 'stepstone';
+  const isDiscovered = (j: Job) => (j.status || '').toLowerCase() === 'discovered';
+
   const linkedInEasyApplyJobs = useMemo(
-    () => jobs.filter((j) => isLinkedInEasyApply(j) && (j.status || '').toLowerCase() === 'discovered'),
+    () => jobs.filter((j) => isLinkedInEasyApply(j) && isDiscovered(j) && !isQaJob(j)),
     [jobs]
   );
 
   const linkedInExternalJobs = useMemo(
-    () => jobs.filter((j) => String(j.source || '').toLowerCase() === 'linkedin' && !isLinkedInEasyApply(j) && (j.status || '').toLowerCase() === 'discovered'),
+    () => jobs.filter((j) => isLinkedIn(j) && !isLinkedInEasyApply(j) && isDiscovered(j) && !isQaJob(j)),
     [jobs]
   );
 
   const linkedInExternalRemoteJobs = useMemo(
-    () => jobs.filter((j) => String(j.source || '').toLowerCase() === 'linkedin' && !isLinkedInEasyApply(j) && (j.status || '').toLowerCase() === 'discovered' && (j.workplace_type_enum || '').toUpperCase() === 'REMOTE'),
+    () => jobs.filter((j) => isLinkedIn(j) && !isLinkedInEasyApply(j) && isDiscovered(j) && !isQaJob(j) && (j.workplace_type_enum || '').toUpperCase() === 'REMOTE'),
     [jobs]
   );
 
   const linkedInExternalHybridJobs = useMemo(
-    () => jobs.filter((j) => String(j.source || '').toLowerCase() === 'linkedin' && !isLinkedInEasyApply(j) && (j.status || '').toLowerCase() === 'discovered' && (j.workplace_type_enum || '').toUpperCase() === 'HYBRID'),
+    () => jobs.filter((j) => isLinkedIn(j) && !isLinkedInEasyApply(j) && isDiscovered(j) && !isQaJob(j) && (j.workplace_type_enum || '').toUpperCase() === 'HYBRID'),
     [jobs]
   );
 
   const linkedInExternalOnsiteJobs = useMemo(
-    () => jobs.filter((j) => String(j.source || '').toLowerCase() === 'linkedin' && !isLinkedInEasyApply(j) && (j.status || '').toLowerCase() === 'discovered' && (j.workplace_type_enum || '').toUpperCase() === 'IN_OFFICE'),
+    () => jobs.filter((j) => isLinkedIn(j) && !isLinkedInEasyApply(j) && isDiscovered(j) && !isQaJob(j) && (j.workplace_type_enum || '').toUpperCase() === 'IN_OFFICE'),
+    [jobs]
+  );
+
+  // QA mirror of the five LinkedIn cards above, doubled per region — each
+  // region is scraped by its own Apify Task (src/config.py
+  // LINKEDIN_QA_DUBAI_TASK_ID / LINKEDIN_QA_EUROPE_TASK_ID) and stamped with
+  // qa_region by fetch_linkedin_jobs_via_apify_task, so the two regions never
+  // mix. Indeed/BuiltIn have no QA search pass yet, so no QA equivalent there.
+  const isQaRegion = (j: Job, region: string) => isQaJob(j) && (j.qa_region || '').toLowerCase() === region;
+
+  const qaDubaiLinkedInEasyApplyJobs = useMemo(
+    () => jobs.filter((j) => isLinkedInEasyApply(j) && isDiscovered(j) && isQaRegion(j, 'dubai')),
+    [jobs]
+  );
+
+  // "External" is deliberately the leftover bucket — a job already sorted
+  // into Remote/Hybrid/Onsite below is excluded here so the four cards are
+  // mutually exclusive (no job counted in two cards at once). Before this,
+  // "External" included every non-Easy-Apply job regardless of type, so a
+  // Hybrid-tagged job would show up under both "External" and "Hybrid".
+  const qaDubaiLinkedInExternalJobs = useMemo(
+    () => jobs.filter((j) => isLinkedIn(j) && !isLinkedInEasyApply(j) && isDiscovered(j) && isQaRegion(j, 'dubai') && !j.workplace_type_enum),
+    [jobs]
+  );
+
+  const qaDubaiLinkedInExternalRemoteJobs = useMemo(
+    () => jobs.filter((j) => isLinkedIn(j) && !isLinkedInEasyApply(j) && isDiscovered(j) && isQaRegion(j, 'dubai') && (j.workplace_type_enum || '').toUpperCase() === 'REMOTE'),
+    [jobs]
+  );
+
+  const qaDubaiLinkedInExternalHybridJobs = useMemo(
+    () => jobs.filter((j) => isLinkedIn(j) && !isLinkedInEasyApply(j) && isDiscovered(j) && isQaRegion(j, 'dubai') && (j.workplace_type_enum || '').toUpperCase() === 'HYBRID'),
+    [jobs]
+  );
+
+  const qaDubaiLinkedInExternalOnsiteJobs = useMemo(
+    () => jobs.filter((j) => isLinkedIn(j) && !isLinkedInEasyApply(j) && isDiscovered(j) && isQaRegion(j, 'dubai') && (j.workplace_type_enum || '').toUpperCase() === 'IN_OFFICE'),
+    [jobs]
+  );
+
+  const qaEuropeLinkedInEasyApplyJobs = useMemo(
+    () => jobs.filter((j) => isLinkedInEasyApply(j) && isDiscovered(j) && isQaRegion(j, 'europe')),
+    [jobs]
+  );
+
+  // Same mutual-exclusivity fix as the Dubai card above.
+  const qaEuropeLinkedInExternalJobs = useMemo(
+    () => jobs.filter((j) => isLinkedIn(j) && !isLinkedInEasyApply(j) && isDiscovered(j) && isQaRegion(j, 'europe') && !j.workplace_type_enum),
+    [jobs]
+  );
+
+  const qaEuropeLinkedInExternalRemoteJobs = useMemo(
+    () => jobs.filter((j) => isLinkedIn(j) && !isLinkedInEasyApply(j) && isDiscovered(j) && isQaRegion(j, 'europe') && (j.workplace_type_enum || '').toUpperCase() === 'REMOTE'),
+    [jobs]
+  );
+
+  const qaEuropeLinkedInExternalHybridJobs = useMemo(
+    () => jobs.filter((j) => isLinkedIn(j) && !isLinkedInEasyApply(j) && isDiscovered(j) && isQaRegion(j, 'europe') && (j.workplace_type_enum || '').toUpperCase() === 'HYBRID'),
+    [jobs]
+  );
+
+  const qaEuropeLinkedInExternalOnsiteJobs = useMemo(
+    () => jobs.filter((j) => isLinkedIn(j) && !isLinkedInEasyApply(j) && isDiscovered(j) && isQaRegion(j, 'europe') && (j.workplace_type_enum || '').toUpperCase() === 'IN_OFFICE'),
+    [jobs]
+  );
+
+  // StepStone — a third, separate QA region (Germany-market, kept fully
+  // apart from the LinkedIn Dubai/Europe QA passes per explicit
+  // instruction). No Easy Apply card here: that's a LinkedIn-specific apply
+  // flow that doesn't exist for StepStone postings, which link straight to
+  // the StepStone listing itself — so only External/Remote/Hybrid/Onsite.
+  const qaStepStoneExternalJobs = useMemo(
+    () => jobs.filter((j) => isStepStone(j) && isDiscovered(j) && isQaRegion(j, 'stepstone') && !j.workplace_type_enum),
+    [jobs]
+  );
+
+  const qaStepStoneExternalRemoteJobs = useMemo(
+    () => jobs.filter((j) => isStepStone(j) && isDiscovered(j) && isQaRegion(j, 'stepstone') && (j.workplace_type_enum || '').toUpperCase() === 'REMOTE'),
+    [jobs]
+  );
+
+  const qaStepStoneExternalHybridJobs = useMemo(
+    () => jobs.filter((j) => isStepStone(j) && isDiscovered(j) && isQaRegion(j, 'stepstone') && (j.workplace_type_enum || '').toUpperCase() === 'HYBRID'),
+    [jobs]
+  );
+
+  const qaStepStoneExternalOnsiteJobs = useMemo(
+    () => jobs.filter((j) => isStepStone(j) && isDiscovered(j) && isQaRegion(j, 'stepstone') && (j.workplace_type_enum || '').toUpperCase() === 'IN_OFFICE'),
     [jobs]
   );
 
@@ -345,6 +460,34 @@ const App: React.FC = () => {
       filtered = linkedInExternalHybridJobs;
     } else if (overviewMode === 'linkedin_external_onsite') {
       filtered = linkedInExternalOnsiteJobs;
+    } else if (overviewMode === 'qa_dubai_linkedin_easy_apply') {
+      filtered = qaDubaiLinkedInEasyApplyJobs;
+    } else if (overviewMode === 'qa_dubai_linkedin_external') {
+      filtered = qaDubaiLinkedInExternalJobs;
+    } else if (overviewMode === 'qa_dubai_linkedin_external_remote') {
+      filtered = qaDubaiLinkedInExternalRemoteJobs;
+    } else if (overviewMode === 'qa_dubai_linkedin_external_hybrid') {
+      filtered = qaDubaiLinkedInExternalHybridJobs;
+    } else if (overviewMode === 'qa_dubai_linkedin_external_onsite') {
+      filtered = qaDubaiLinkedInExternalOnsiteJobs;
+    } else if (overviewMode === 'qa_europe_linkedin_easy_apply') {
+      filtered = qaEuropeLinkedInEasyApplyJobs;
+    } else if (overviewMode === 'qa_europe_linkedin_external') {
+      filtered = qaEuropeLinkedInExternalJobs;
+    } else if (overviewMode === 'qa_europe_linkedin_external_remote') {
+      filtered = qaEuropeLinkedInExternalRemoteJobs;
+    } else if (overviewMode === 'qa_europe_linkedin_external_hybrid') {
+      filtered = qaEuropeLinkedInExternalHybridJobs;
+    } else if (overviewMode === 'qa_europe_linkedin_external_onsite') {
+      filtered = qaEuropeLinkedInExternalOnsiteJobs;
+    } else if (overviewMode === 'qa_stepstone_external') {
+      filtered = qaStepStoneExternalJobs;
+    } else if (overviewMode === 'qa_stepstone_external_remote') {
+      filtered = qaStepStoneExternalRemoteJobs;
+    } else if (overviewMode === 'qa_stepstone_external_hybrid') {
+      filtered = qaStepStoneExternalHybridJobs;
+    } else if (overviewMode === 'qa_stepstone_external_onsite') {
+      filtered = qaStepStoneExternalOnsiteJobs;
     } else if (overviewMode === 'indeed') {
       filtered = indeedJobs;
     } else if (overviewMode === 'builtin') {
@@ -363,7 +506,7 @@ const App: React.FC = () => {
       job.job_title.toLowerCase().includes(searchTerm.toLowerCase()) ||
       job.company.toLowerCase().includes(searchTerm.toLowerCase())
     );
-  }, [overviewMode, allJobs, jobs, linkedInEasyApplyJobs, linkedInExternalJobs, linkedInExternalRemoteJobs, linkedInExternalHybridJobs, linkedInExternalOnsiteJobs, indeedJobs, builtInJobs, builtInRemoteJobs, searchTerm]);
+  }, [overviewMode, allJobs, jobs, linkedInEasyApplyJobs, linkedInExternalJobs, linkedInExternalRemoteJobs, linkedInExternalHybridJobs, linkedInExternalOnsiteJobs, qaDubaiLinkedInEasyApplyJobs, qaDubaiLinkedInExternalJobs, qaDubaiLinkedInExternalRemoteJobs, qaDubaiLinkedInExternalHybridJobs, qaDubaiLinkedInExternalOnsiteJobs, qaEuropeLinkedInEasyApplyJobs, qaEuropeLinkedInExternalJobs, qaEuropeLinkedInExternalRemoteJobs, qaEuropeLinkedInExternalHybridJobs, qaEuropeLinkedInExternalOnsiteJobs, qaStepStoneExternalJobs, qaStepStoneExternalRemoteJobs, qaStepStoneExternalHybridJobs, qaStepStoneExternalOnsiteJobs, indeedJobs, builtInJobs, builtInRemoteJobs, searchTerm]);
 
   // Switching cards should always show that card's full list — a search term
   // left over from browsing a previous card would otherwise keep silently
@@ -373,6 +516,25 @@ const App: React.FC = () => {
   const selectOverviewMode = (mode: typeof overviewMode) => {
     setSearchTerm('');
     setOverviewMode(mode);
+  };
+
+  // Switching category jumps straight to that category's LinkedIn External
+  // card (its most useful default) instead of leaving overviewMode pointed at
+  // a card that doesn't exist for the other category (e.g. staying on
+  // 'linkedin_external_hybrid' after switching to the QA tab would silently
+  // show an empty list there, since that mode only ever matches
+  // data_engineering jobs — and vice versa switching back to Overview.
+  const goToOverviewTab = () => {
+    setActiveTab('overview');
+    if (overviewMode.startsWith('qa_')) {
+      selectOverviewMode('linkedin_external');
+    }
+  };
+  const goToQaTab = () => {
+    setActiveTab('qa');
+    if (!overviewMode.startsWith('qa_')) {
+      selectOverviewMode('qa_dubai_linkedin_external');
+    }
   };
 
   const appliedCount = appliedJobs.length;
@@ -392,7 +554,18 @@ const App: React.FC = () => {
   const tailorSelectedJob = async (jobId: string) => {
     setIsGeneratingPreview(true);
     try {
-      const tailorRes = await axios.post(`${API_BASE}/jobs/tailor/${jobId}`);
+      // Send the job data already sitting in memory (fetched earlier via
+      // /jobs) along with the request. The backend used to always re-find the
+      // job by re-reading whichever discovery snapshot file is currently
+      // "latest" — but a background scan can overwrite those files with a
+      // different result set at any moment, independent of what's on screen.
+      // Confirmed live: a job mid Auto-Apply vanished from that lookup between
+      // page load and this call and failed with "Job not found" even though
+      // it was still right here selected on screen. Passing it directly
+      // removes the race entirely — the backend still falls back to its own
+      // lookup if this is omitted or stale.
+      const jobData = allJobs.find((j) => String(j.id) === String(jobId)) || jobs.find((j) => String(j.id) === String(jobId)) || null;
+      const tailorRes = await axios.post(`${API_BASE}/jobs/tailor/${jobId}`, jobData || undefined);
       if (tailorRes.data?.tailored) {
         setTailoredPreview(tailorRes.data.tailored);
         return tailorRes.data.tailored;
@@ -469,11 +642,18 @@ const App: React.FC = () => {
         return;
       }
 
-      setAutoApplyChain({ active: true, jobId, phase: 'await_cv_update', countdown: 15 });
+      setAutoApplyChain({ active: true, jobId, phase: 'await_cv_update', countdown: CV_UPDATE_WINDOW_SECONDS });
       clearAutoApplyTimer();
       autoApplyTimerRef.current = window.setInterval(() => {
         setAutoApplyChain((prev) => {
           if (!prev.active || prev.jobId !== jobId || prev.phase !== 'await_cv_update') {
+            return prev;
+          }
+          // Don't let the visible countdown hit 0 while a CV upload is actively in
+          // flight — that's exactly the race that used to start tailoring on the
+          // stale CV while the new one was still uploading/parsing. Hold at 1s
+          // until the upload settles instead of ticking past it.
+          if (isUploadingRef.current && (prev.countdown || 0) <= 1) {
             return prev;
           }
           const next = Math.max(0, (prev.countdown || 0) - 1);
@@ -481,12 +661,22 @@ const App: React.FC = () => {
         });
       }, 1000);
 
-      window.setTimeout(() => {
-        clearAutoApplyTimer();
+      window.setTimeout(function fireWhenReady() {
         const current = autoApplyStateRef.current;
-        if (!current.active || current.jobId !== jobId || current.phase !== 'await_cv_update') return;
+        if (!current.active || current.jobId !== jobId || current.phase !== 'await_cv_update') {
+          clearAutoApplyTimer();
+          return;
+        }
+        // Same guard as above for the actual proceed call: a slow upload (or one
+        // that's retrying a Groq rate limit) can still be running once the base
+        // window elapses — wait it out instead of proceeding on the old CV.
+        if (isUploadingRef.current) {
+          window.setTimeout(fireWhenReady, 1000);
+          return;
+        }
+        clearAutoApplyTimer();
         proceedWithAutoApply(jobId);
-      }, 15100);
+      }, CV_UPDATE_WINDOW_SECONDS * 1000 + 100);
     } catch (e: any) {
       const detail = e.response?.data?.detail || e.message || 'Unknown error';
       cancelAutoApplyChain(`Auto Apply failed: ${detail}`);
@@ -608,8 +798,6 @@ const App: React.FC = () => {
     }
   };
 
-  const [isUploading, setIsUploading] = useState(false);
-
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!e.target.files?.[0]) return;
     const selectedFile = e.target.files[0];
@@ -634,8 +822,13 @@ const App: React.FC = () => {
         setActiveTab('start');
         proceedWithAutoApply(chainJobId);
       }
-    } catch {
-      alert('Failed to upload CV');
+    } catch (err: any) {
+      // Surface the actual backend reason (e.g. a Groq rate-limit after retries
+      // are exhausted) instead of a generic message — a silent "Failed to
+      // upload CV" gave no way to tell a real parsing failure apart from a
+      // transient rate limit worth just retrying.
+      const detail = err?.response?.data?.detail || err?.message || 'Unknown error';
+      alert(`Failed to upload CV: ${detail}`);
     } finally {
       setIsUploading(false);
       // Allow selecting the same file again and still trigger onChange.
@@ -839,7 +1032,8 @@ const App: React.FC = () => {
       )}
 
       <nav className="tab-navigation">
-        <button className={`tab-item ${activeTab === 'overview' ? 'active' : ''}`} onClick={() => setActiveTab('overview')}>Overview</button>
+        <button className={`tab-item ${activeTab === 'overview' ? 'active' : ''}`} onClick={goToOverviewTab}>Overview</button>
+        <button className={`tab-item ${activeTab === 'qa' ? 'active' : ''}`} onClick={goToQaTab}>QA Jobs</button>
         <button className={`tab-item ${activeTab === 'start' ? 'active' : ''}`} onClick={() => setActiveTab('start')}>Start Application</button>
         <button className={`tab-item ${activeTab === 'applied' ? 'active' : ''}`} onClick={() => setActiveTab('applied')}>Applied Jobs</button>
       </nav>
@@ -848,6 +1042,7 @@ const App: React.FC = () => {
         {activeTab === 'overview' && (
           <div className="tab-pane overview-pane">
             <h2 className="mb-4">System Overview</h2>
+
             <div className="metrics-grid">
               <div className={`stat-card cursor-pointer ${overviewMode === 'all' ? 'active-all' : ''}`} onClick={() => selectOverviewMode('all')}>
                 <div className="stat-label">Total Jobs Scraped</div>
@@ -860,87 +1055,87 @@ const App: React.FC = () => {
               </div>
 
               <div className={`stat-card cursor-pointer ${overviewMode === 'linkedin_external' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('linkedin_external')}>
-                <div className="stat-label">LinkedIn External Jobs</div>
-                <div className="stat-value">{linkedInExternalJobs.length}</div>
-                <div className="source-breakdown mt-2 text-sm text-muted">
-                  <p>LinkedIn jobs requiring external application</p>
-                </div>
-              </div>
+                    <div className="stat-label">LinkedIn External Jobs</div>
+                    <div className="stat-value">{linkedInExternalJobs.length}</div>
+                    <div className="source-breakdown mt-2 text-sm text-muted">
+                      <p>LinkedIn jobs requiring external application</p>
+                    </div>
+                  </div>
 
-              <div className={`stat-card cursor-pointer ${overviewMode === 'linkedin_external_remote' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('linkedin_external_remote')}>
-                <div className="stat-label">LinkedIn External Remote</div>
-                <div className="stat-value">{linkedInExternalRemoteJobs.length}</div>
-                <div className="source-breakdown mt-2 text-sm text-muted">
-                  <p>LinkedIn external jobs marked as fully remote</p>
-                </div>
-              </div>
+                  <div className={`stat-card cursor-pointer ${overviewMode === 'linkedin_external_remote' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('linkedin_external_remote')}>
+                    <div className="stat-label">LinkedIn External Remote</div>
+                    <div className="stat-value">{linkedInExternalRemoteJobs.length}</div>
+                    <div className="source-breakdown mt-2 text-sm text-muted">
+                      <p>LinkedIn external jobs marked as fully remote</p>
+                    </div>
+                  </div>
 
-              <div className={`stat-card cursor-pointer ${overviewMode === 'linkedin_external_hybrid' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('linkedin_external_hybrid')}>
-                <div className="stat-label">LinkedIn External Hybrid</div>
-                <div className="stat-value">{linkedInExternalHybridJobs.length}</div>
-                <div className="source-breakdown mt-2 text-sm text-muted">
-                  <p>LinkedIn external jobs with hybrid work arrangement</p>
-                </div>
-              </div>
+                  <div className={`stat-card cursor-pointer ${overviewMode === 'linkedin_external_hybrid' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('linkedin_external_hybrid')}>
+                    <div className="stat-label">LinkedIn External Hybrid</div>
+                    <div className="stat-value">{linkedInExternalHybridJobs.length}</div>
+                    <div className="source-breakdown mt-2 text-sm text-muted">
+                      <p>LinkedIn external jobs with hybrid work arrangement</p>
+                    </div>
+                  </div>
 
-              <div className={`stat-card cursor-pointer ${overviewMode === 'linkedin_external_onsite' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('linkedin_external_onsite')}>
-                <div className="stat-label">LinkedIn External On-Site</div>
-                <div className="stat-value">{linkedInExternalOnsiteJobs.length}</div>
-                <div className="source-breakdown mt-2 text-sm text-muted">
-                  <p>LinkedIn external jobs requiring on-site presence</p>
-                </div>
-              </div>
+                  <div className={`stat-card cursor-pointer ${overviewMode === 'linkedin_external_onsite' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('linkedin_external_onsite')}>
+                    <div className="stat-label">LinkedIn External On-Site</div>
+                    <div className="stat-value">{linkedInExternalOnsiteJobs.length}</div>
+                    <div className="source-breakdown mt-2 text-sm text-muted">
+                      <p>LinkedIn external jobs requiring on-site presence</p>
+                    </div>
+                  </div>
 
-              <div className={`stat-card cursor-pointer ${overviewMode === 'indeed' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('indeed')}>
-                <div className="stat-label">Indeed Jobs</div>
-                <div className="stat-value">{indeedJobs.length}</div>
-                <div className="source-breakdown mt-2 text-sm text-muted">
-                  <p>Jobs discovered on Indeed</p>
-                </div>
-              </div>
+                  <div className={`stat-card cursor-pointer ${overviewMode === 'indeed' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('indeed')}>
+                    <div className="stat-label">Indeed Jobs</div>
+                    <div className="stat-value">{indeedJobs.length}</div>
+                    <div className="source-breakdown mt-2 text-sm text-muted">
+                      <p>Jobs discovered on Indeed</p>
+                    </div>
+                  </div>
 
-              <div className={`stat-card cursor-pointer ${overviewMode === 'builtin_remote' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('builtin_remote')}>
-                <div className="stat-label">Built In Remote Jobs (US)</div>
-                <div className="stat-value">{builtInRemoteJobs.length}</div>
-                <div className="source-breakdown mt-2 text-sm text-muted">
-                  <p>Fully remote, US-based Built In jobs only</p>
-                  <p className="text-xs">Fetched: {builtInSourceStats.fetched} · New today: {builtInSourceStats.newToday} · Already actioned: {builtInSourceStats.alreadyActioned}</p>
-                </div>
-              </div>
+                  <div className={`stat-card cursor-pointer ${overviewMode === 'builtin_remote' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('builtin_remote')}>
+                    <div className="stat-label">Built In Remote Jobs (US)</div>
+                    <div className="stat-value">{builtInRemoteJobs.length}</div>
+                    <div className="source-breakdown mt-2 text-sm text-muted">
+                      <p>Fully remote, US-based Built In jobs only</p>
+                      <p className="text-xs">Fetched: {builtInSourceStats.fetched} · New today: {builtInSourceStats.newToday} · Already actioned: {builtInSourceStats.alreadyActioned}</p>
+                    </div>
+                  </div>
 
-              <div className={`stat-card cursor-pointer ${overviewMode === 'builtin' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('builtin')}>
-                <div className="stat-label">Built In Jobs</div>
-                <div className="stat-value">{builtInJobs.length}</div>
-                <div className="source-breakdown mt-2 text-sm text-muted">
-                  <p>Hybrid, in-office, or non-US Built In jobs</p>
-                  <p className="text-xs">Fetched: {builtInSourceStats.fetched} · New today: {builtInSourceStats.newToday} · Already actioned: {builtInSourceStats.alreadyActioned}</p>
-                </div>
-              </div>
+                  <div className={`stat-card cursor-pointer ${overviewMode === 'builtin' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('builtin')}>
+                    <div className="stat-label">Built In Jobs</div>
+                    <div className="stat-value">{builtInJobs.length}</div>
+                    <div className="source-breakdown mt-2 text-sm text-muted">
+                      <p>Hybrid, in-office, or non-US Built In jobs</p>
+                      <p className="text-xs">Fetched: {builtInSourceStats.fetched} · New today: {builtInSourceStats.newToday} · Already actioned: {builtInSourceStats.alreadyActioned}</p>
+                    </div>
+                  </div>
 
-              <div className={`stat-card border-success-subtle cursor-pointer ${overviewMode === 'crossmatch' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('crossmatch')}>
-                <div className="stat-label">Unique Jobs</div>
-                <div className="stat-value text-success">{summary?.cross_platform_duplicates || 0}</div>
-                <div className="source-breakdown mt-2 text-sm text-muted">
-                  <p>Posted on more than one platform</p>
-                </div>
-              </div>
+                  <div className={`stat-card border-success-subtle cursor-pointer ${overviewMode === 'crossmatch' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('crossmatch')}>
+                    <div className="stat-label">Unique Jobs</div>
+                    <div className="stat-value text-success">{summary?.cross_platform_duplicates || 0}</div>
+                    <div className="source-breakdown mt-2 text-sm text-muted">
+                      <p>Posted on more than one platform</p>
+                    </div>
+                  </div>
 
-              <div className={`stat-card border-warning-subtle cursor-pointer ${overviewMode === 'pipeline' ? 'active-pipeline' : ''}`} onClick={() => selectOverviewMode('pipeline')}>
-                <div className="stat-label">Application Pipeline (Today)</div>
-                <div className="stat-value text-warning">{summary?.tailored_today || 0}</div>
-                <div className="source-breakdown mt-2 text-sm text-muted">
-                  <p>Tailored & Ready today: {summary?.tailored_today || 0}</p>
-                  <p>Successfully Applied: {appliedCount}</p>
-                </div>
-              </div>
+                  <div className={`stat-card border-warning-subtle cursor-pointer ${overviewMode === 'pipeline' ? 'active-pipeline' : ''}`} onClick={() => selectOverviewMode('pipeline')}>
+                    <div className="stat-label">Application Pipeline (Today)</div>
+                    <div className="stat-value text-warning">{summary?.tailored_today || 0}</div>
+                    <div className="source-breakdown mt-2 text-sm text-muted">
+                      <p>Tailored & Ready today: {summary?.tailored_today || 0}</p>
+                      <p>Successfully Applied: {appliedCount}</p>
+                    </div>
+                  </div>
 
-              <div className={`stat-card cursor-pointer ${overviewMode === 'linkedin_easy_apply' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('linkedin_easy_apply')}>
-                <div className="stat-label">LinkedIn Easy Apply</div>
-                <div className="stat-value">{linkedInEasyApplyJobs.length}</div>
-                <div className="source-breakdown mt-2 text-sm text-muted">
-                  <p>LinkedIn jobs confirmed to use LinkedIn's own Easy Apply flow</p>
-                </div>
-              </div>
+                  <div className={`stat-card cursor-pointer ${overviewMode === 'linkedin_easy_apply' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('linkedin_easy_apply')}>
+                    <div className="stat-label">LinkedIn Easy Apply</div>
+                    <div className="stat-value">{linkedInEasyApplyJobs.length}</div>
+                    <div className="source-breakdown mt-2 text-sm text-muted">
+                      <p>LinkedIn jobs confirmed to use LinkedIn's own Easy Apply flow</p>
+                    </div>
+                  </div>
             </div>
 
             <div className="overview-jobs-section">
@@ -995,6 +1190,195 @@ const App: React.FC = () => {
               </div>
             </div>
 
+          </div>
+        )}
+
+        {activeTab === 'qa' && (
+          <div className="tab-pane overview-pane">
+            <h2 className="mb-4">Quality Assurance Jobs</h2>
+
+            <h3 className="mb-2">Dubai</h3>
+            <div className="metrics-grid">
+              <div className={`stat-card cursor-pointer ${overviewMode === 'qa_dubai_linkedin_external' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('qa_dubai_linkedin_external')}>
+                <div className="stat-label">LinkedIn QA External Jobs</div>
+                <div className="stat-value">{qaDubaiLinkedInExternalJobs.length}</div>
+                <div className="source-breakdown mt-2 text-sm text-muted">
+                  <p>QA/testing LinkedIn jobs (Dubai) requiring external application, not yet tagged Remote/Hybrid/On-site</p>
+                </div>
+              </div>
+
+              <div className={`stat-card cursor-pointer ${overviewMode === 'qa_dubai_linkedin_external_remote' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('qa_dubai_linkedin_external_remote')}>
+                <div className="stat-label">LinkedIn QA External Remote</div>
+                <div className="stat-value">{qaDubaiLinkedInExternalRemoteJobs.length}</div>
+                <div className="source-breakdown mt-2 text-sm text-muted">
+                  <p>Dubai QA external jobs marked as fully remote</p>
+                </div>
+              </div>
+
+              <div className={`stat-card cursor-pointer ${overviewMode === 'qa_dubai_linkedin_external_hybrid' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('qa_dubai_linkedin_external_hybrid')}>
+                <div className="stat-label">LinkedIn QA External Hybrid</div>
+                <div className="stat-value">{qaDubaiLinkedInExternalHybridJobs.length}</div>
+                <div className="source-breakdown mt-2 text-sm text-muted">
+                  <p>Dubai QA external jobs with hybrid work arrangement</p>
+                </div>
+              </div>
+
+              <div className={`stat-card cursor-pointer ${overviewMode === 'qa_dubai_linkedin_external_onsite' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('qa_dubai_linkedin_external_onsite')}>
+                <div className="stat-label">LinkedIn QA External On-Site</div>
+                <div className="stat-value">{qaDubaiLinkedInExternalOnsiteJobs.length}</div>
+                <div className="source-breakdown mt-2 text-sm text-muted">
+                  <p>Dubai QA external jobs requiring on-site presence</p>
+                </div>
+              </div>
+
+              <div className={`stat-card cursor-pointer ${overviewMode === 'qa_dubai_linkedin_easy_apply' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('qa_dubai_linkedin_easy_apply')}>
+                <div className="stat-label">LinkedIn QA Easy Apply</div>
+                <div className="stat-value">{qaDubaiLinkedInEasyApplyJobs.length}</div>
+                <div className="source-breakdown mt-2 text-sm text-muted">
+                  <p>Dubai QA LinkedIn jobs confirmed to use LinkedIn's own Easy Apply flow</p>
+                </div>
+              </div>
+            </div>
+
+            <h3 className="mb-2 mt-4">Europe</h3>
+            <div className="metrics-grid">
+              <div className={`stat-card cursor-pointer ${overviewMode === 'qa_europe_linkedin_external' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('qa_europe_linkedin_external')}>
+                <div className="stat-label">LinkedIn QA External Jobs</div>
+                <div className="stat-value">{qaEuropeLinkedInExternalJobs.length}</div>
+                <div className="source-breakdown mt-2 text-sm text-muted">
+                  <p>QA/testing LinkedIn jobs (Europe) requiring external application, not yet tagged Remote/Hybrid/On-site</p>
+                </div>
+              </div>
+
+              <div className={`stat-card cursor-pointer ${overviewMode === 'qa_europe_linkedin_external_remote' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('qa_europe_linkedin_external_remote')}>
+                <div className="stat-label">LinkedIn QA External Remote</div>
+                <div className="stat-value">{qaEuropeLinkedInExternalRemoteJobs.length}</div>
+                <div className="source-breakdown mt-2 text-sm text-muted">
+                  <p>Europe QA external jobs marked as fully remote</p>
+                </div>
+              </div>
+
+              <div className={`stat-card cursor-pointer ${overviewMode === 'qa_europe_linkedin_external_hybrid' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('qa_europe_linkedin_external_hybrid')}>
+                <div className="stat-label">LinkedIn QA External Hybrid</div>
+                <div className="stat-value">{qaEuropeLinkedInExternalHybridJobs.length}</div>
+                <div className="source-breakdown mt-2 text-sm text-muted">
+                  <p>Europe QA external jobs with hybrid work arrangement</p>
+                </div>
+              </div>
+
+              <div className={`stat-card cursor-pointer ${overviewMode === 'qa_europe_linkedin_external_onsite' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('qa_europe_linkedin_external_onsite')}>
+                <div className="stat-label">LinkedIn QA External On-Site</div>
+                <div className="stat-value">{qaEuropeLinkedInExternalOnsiteJobs.length}</div>
+                <div className="source-breakdown mt-2 text-sm text-muted">
+                  <p>Europe QA external jobs requiring on-site presence</p>
+                </div>
+              </div>
+
+              <div className={`stat-card cursor-pointer ${overviewMode === 'qa_europe_linkedin_easy_apply' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('qa_europe_linkedin_easy_apply')}>
+                <div className="stat-label">LinkedIn QA Easy Apply</div>
+                <div className="stat-value">{qaEuropeLinkedInEasyApplyJobs.length}</div>
+                <div className="source-breakdown mt-2 text-sm text-muted">
+                  <p>Europe QA LinkedIn jobs confirmed to use LinkedIn's own Easy Apply flow</p>
+                </div>
+              </div>
+            </div>
+
+            <h3 className="mb-2 mt-4">StepStone (Germany)</h3>
+            <div className="metrics-grid">
+              <div className={`stat-card cursor-pointer ${overviewMode === 'qa_stepstone_external' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('qa_stepstone_external')}>
+                <div className="stat-label">StepStone QA External Jobs</div>
+                <div className="stat-value">{qaStepStoneExternalJobs.length}</div>
+                <div className="source-breakdown mt-2 text-sm text-muted">
+                  <p>QA/testing StepStone jobs (Germany), not yet tagged Remote/Hybrid/On-site</p>
+                </div>
+              </div>
+
+              <div className={`stat-card cursor-pointer ${overviewMode === 'qa_stepstone_external_remote' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('qa_stepstone_external_remote')}>
+                <div className="stat-label">StepStone QA Remote</div>
+                <div className="stat-value">{qaStepStoneExternalRemoteJobs.length}</div>
+                <div className="source-breakdown mt-2 text-sm text-muted">
+                  <p>StepStone QA jobs marked as fully remote</p>
+                </div>
+              </div>
+
+              <div className={`stat-card cursor-pointer ${overviewMode === 'qa_stepstone_external_hybrid' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('qa_stepstone_external_hybrid')}>
+                <div className="stat-label">StepStone QA Hybrid</div>
+                <div className="stat-value">{qaStepStoneExternalHybridJobs.length}</div>
+                <div className="source-breakdown mt-2 text-sm text-muted">
+                  <p>StepStone QA jobs with hybrid work arrangement</p>
+                </div>
+              </div>
+
+              <div className={`stat-card cursor-pointer ${overviewMode === 'qa_stepstone_external_onsite' ? 'active-unique' : ''}`} onClick={() => selectOverviewMode('qa_stepstone_external_onsite')}>
+                <div className="stat-label">StepStone QA On-Site</div>
+                <div className="stat-value">{qaStepStoneExternalOnsiteJobs.length}</div>
+                <div className="source-breakdown mt-2 text-sm text-muted">
+                  <p>StepStone QA jobs requiring on-site presence</p>
+                </div>
+              </div>
+            </div>
+
+            <div className="overview-jobs-section">
+              <div className="overview-jobs-header">
+                <div>
+                  <h3>
+                    {overviewMode === 'qa_dubai_linkedin_external' ? 'LinkedIn QA External Jobs (Dubai)' :
+                     overviewMode === 'qa_dubai_linkedin_external_remote' ? 'LinkedIn QA External Remote Jobs (Dubai)' :
+                     overviewMode === 'qa_dubai_linkedin_external_hybrid' ? 'LinkedIn QA External Hybrid Jobs (Dubai)' :
+                     overviewMode === 'qa_dubai_linkedin_external_onsite' ? 'LinkedIn QA External On-Site Jobs (Dubai)' :
+                     overviewMode === 'qa_dubai_linkedin_easy_apply' ? 'LinkedIn QA Easy Apply (Dubai)' :
+                     overviewMode === 'qa_europe_linkedin_external' ? 'LinkedIn QA External Jobs (Europe)' :
+                     overviewMode === 'qa_europe_linkedin_external_remote' ? 'LinkedIn QA External Remote Jobs (Europe)' :
+                     overviewMode === 'qa_europe_linkedin_external_hybrid' ? 'LinkedIn QA External Hybrid Jobs (Europe)' :
+                     overviewMode === 'qa_europe_linkedin_external_onsite' ? 'LinkedIn QA External On-Site Jobs (Europe)' :
+                     overviewMode === 'qa_europe_linkedin_easy_apply' ? 'LinkedIn QA Easy Apply (Europe)' :
+                     overviewMode === 'qa_stepstone_external' ? 'StepStone QA External Jobs (Germany)' :
+                     overviewMode === 'qa_stepstone_external_remote' ? 'StepStone QA Remote Jobs (Germany)' :
+                     overviewMode === 'qa_stepstone_external_hybrid' ? 'StepStone QA Hybrid Jobs (Germany)' :
+                     overviewMode === 'qa_stepstone_external_onsite' ? 'StepStone QA On-Site Jobs (Germany)' :
+                     'LinkedIn QA External Jobs (Dubai)'}
+                  </h3>
+                  <p>
+                    {overviewMode === 'qa_dubai_linkedin_external'
+                      ? 'Showing Dubai QA/testing LinkedIn jobs that require applying on an external company site and have no Remote/Hybrid/On-site tag yet.'
+                      : overviewMode === 'qa_dubai_linkedin_external_remote'
+                      ? 'Showing Dubai QA external jobs explicitly marked as fully remote.'
+                      : overviewMode === 'qa_dubai_linkedin_external_hybrid'
+                      ? 'Showing Dubai QA external jobs with hybrid work arrangement.'
+                      : overviewMode === 'qa_dubai_linkedin_external_onsite'
+                      ? 'Showing Dubai QA external jobs requiring on-site presence.'
+                      : overviewMode === 'qa_dubai_linkedin_easy_apply'
+                      ? "Dubai QA LinkedIn jobs that use LinkedIn's own Easy Apply flow instead of an external company form."
+                      : overviewMode === 'qa_europe_linkedin_external'
+                      ? 'Showing Europe QA/testing LinkedIn jobs that require applying on an external company site and have no Remote/Hybrid/On-site tag yet.'
+                      : overviewMode === 'qa_europe_linkedin_external_remote'
+                      ? 'Showing Europe QA external jobs explicitly marked as fully remote.'
+                      : overviewMode === 'qa_europe_linkedin_external_hybrid'
+                      ? 'Showing Europe QA external jobs with hybrid work arrangement.'
+                      : overviewMode === 'qa_europe_linkedin_external_onsite'
+                      ? 'Showing Europe QA external jobs requiring on-site presence.'
+                      : overviewMode === 'qa_europe_linkedin_easy_apply'
+                      ? "Europe QA LinkedIn jobs that use LinkedIn's own Easy Apply flow instead of an external company form."
+                      : overviewMode === 'qa_stepstone_external'
+                      ? 'Showing StepStone (Germany) QA/testing jobs with no Remote/Hybrid/On-site tag yet.'
+                      : overviewMode === 'qa_stepstone_external_remote'
+                      ? 'Showing StepStone QA jobs explicitly marked as fully remote.'
+                      : overviewMode === 'qa_stepstone_external_hybrid'
+                      ? 'Showing StepStone QA jobs with hybrid work arrangement.'
+                      : overviewMode === 'qa_stepstone_external_onsite'
+                      ? 'Showing StepStone QA jobs requiring on-site presence.'
+                      : 'Showing Dubai QA/testing LinkedIn jobs that require applying on an external company site and have no Remote/Hybrid/On-site tag yet.'}
+                  </p>
+                </div>
+                <span className="badge badge-warning">{overviewJobs.length} Jobs</span>
+              </div>
+
+              <div className="job-cards-grid overview-job-grid">
+                <AnimatePresence>
+                  {overviewJobs.map((job, index) => renderJobCard(job, index))}
+                </AnimatePresence>
+              </div>
+            </div>
           </div>
         )}
 

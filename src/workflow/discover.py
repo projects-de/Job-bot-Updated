@@ -9,10 +9,11 @@ from urllib.parse import urlsplit, urlunsplit
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 from src import config
-from src.discovery.linkedin_api import fetch_linkedin_jobs_via_apify_api
+from src.discovery.linkedin_api import fetch_linkedin_jobs_via_apify_api, fetch_linkedin_jobs_via_apify_task
 from src.discovery.indeed_api import fetch_indeed_jobs_via_apify_api
 from src.discovery.dice_api import fetch_dice_jobs_via_apify_api
 from src.discovery.builtin_api import fetch_builtin_jobs_via_apify_api
+from src.discovery.stepstone_api import fetch_stepstone_jobs_via_apify_api
 from src.storage.tracker import save_jobs, save_summary
 from src.utils.logger import error, log
 
@@ -32,7 +33,7 @@ def canonical_job_url(url):
 
 
 # Preference order when the same role is posted on multiple sources — lower wins.
-SOURCE_PRIORITY = {"linkedin": 0, "indeed": 1, "builtin": 2, "dice": 3}
+SOURCE_PRIORITY = {"linkedin": 0, "indeed": 1, "builtin": 2, "dice": 3, "stepstone": 4}
 
 
 def _normalize_for_match(value: str) -> str:
@@ -113,8 +114,64 @@ def is_strict_data_engineer(job: dict) -> bool:
     for ex in ["frontend", "front end", "full stack", "fullstack"]:
         if ex in title:
             return False
-            
+
     return True
+
+
+# Non-software fields confirmed live to show up as noise in the QA task
+# results — industrial/construction ("QAQC Engineer - Mechanical"), unrelated
+# trades, plus BPO/call-center "quality analyst" roles and cybersecurity
+# audit roles (both use QA-adjacent words but aren't the software-QA domain
+# being targeted). Exclusion list, applied on top of the positive keyword
+# match below.
+_NON_SOFTWARE_FIELD_TERMS = [
+    "civil", "mechanical", "electrical", "electromechanical", "construction",
+    "plumbing", "hvac", "elv", "structural", "architect", "welding",
+    "logistics", "inspector", "commissioning", "kitchen", "chef", "f&b",
+    "hospitality", "banking", "workshop", "rail", "metro", "maintenance",
+    "restaurant", "flight attendant", "airbus", "marine", "oil and gas",
+    "oil & gas", "real estate", "warehouse", "driver", "nurse", "nursing",
+    "pharmacist", "clinical", "hotel", "housekeeping", "security guard",
+    "contact center", "call center", "customer service", "cybersecurity",
+]
+
+# Required positive match — confirmed live that the Dubai QA task (unlike the
+# cleaner Europe task) still returns plenty of jobs with no QA/testing
+# relevance at all (ByteDance internships, "TAMM OS Developer", "Digital Twin
+# Manager", "Sharepoint Consultant"...), which the exclusion list alone can't
+# catch since they don't match any wrong-field term either. Short substrings
+# ("test", "automat") are deliberate — they catch multilingual variants
+# (French "Testeur"/"Automaticien", German "Testautomation") that a full-word
+# "tester"/"automation" match would miss.
+_QA_RELEVANCE_TERMS = ["qa", "sdet", "test", "automat", "quality assurance", "quality engineer", "quality analyst"]
+
+
+def is_software_field(job: dict) -> bool:
+    """
+    Exclusion safety net for the LinkedIn QA passes. Also drops the "Ethos"
+    postings confirmed live to be recurring expert-network ads ("Expert
+    Opportunity - Plant Manager", "...Hospital Operations Consultant", etc.)
+    unrelated to any real QA opening, regardless of title.
+    """
+    title = (job.get("job_title") or "").lower()
+    company = (job.get("company") or "").lower()
+    if company == "ethos" or "expert opportunity" in title:
+        return False
+    if any(term in title for term in _NON_SOFTWARE_FIELD_TERMS):
+        return False
+    return True
+
+
+def is_qa_relevant(job: dict) -> bool:
+    """
+    Positive match for the actual domain being targeted — QA, test
+    automation, SDET, software tester — on top of is_software_field's
+    exclusions. Verified live against a real scan: keeps all 50/50 genuine
+    matches from the Europe task and narrows the noisier Dubai task from 15
+    down to the 4 that are actually QA/automation roles.
+    """
+    title = (job.get("job_title") or "").lower()
+    return is_software_field(job) and any(term in title for term in _QA_RELEVANCE_TERMS)
 
 
 def run_discovery():
@@ -125,27 +182,61 @@ def run_discovery():
             raise RuntimeError("APIFY_TOKEN environment variable is not set")
 
         log(f"Search: '{config.JOB_KEYWORDS}' | Location: '{config.JOB_LOCATION}'")
+        log(f"LinkedIn QA tasks: Dubai='{config.LINKEDIN_QA_DUBAI_TASK_ID}', Europe='{config.LINKEDIN_QA_EUROPE_TASK_ID}'")
 
         source_jobs = {
             "LinkedIn": [],
             "Indeed": [],
             "BuiltIn": [],
+            "StepStone": [],
         }
         errors = []
+
+        def _make_linkedin_qa_task_fetcher(task_id: str, region: str):
+            def _fetch():
+                return fetch_linkedin_jobs_via_apify_task(task_id, region=region)
+            return _fetch
 
         # Dice discovery is switched off (fetch_dice_jobs_via_apify_api stays
         # imported above, untouched, so this is a one-line revert if Dice is
         # ever needed again) — Built In takes its place below.
-        fetchers = {
-            "LinkedIn": fetch_linkedin_jobs_via_apify_api,
-            "Indeed": fetch_indeed_jobs_via_apify_api,
-            "BuiltIn": fetch_builtin_jobs_via_apify_api,
-        }
+        #
+        # Each task: (bucket key in source_jobs, job_category stamped onto every
+        # job it returns, the fetch callable, the title filter to apply).
+        # LinkedIn runs once for Data Engineer plus once per QA region task
+        # (Dubai, Europe — pre-configured on the Apify console with their own
+        # search query/location, so nothing is passed at call time) — all
+        # landing in the same "LinkedIn" bucket; job_category is what the
+        # frontend splits on, not a separate top-level source, so by-source
+        # totals still read as "all LinkedIn jobs this scan". Each QA job is
+        # additionally stamped with qa_region ("dubai"/"europe") by
+        # fetch_linkedin_jobs_via_apify_task so the frontend can show separate
+        # cards per region.
+        tasks = [
+            # Data Engineering actor calls (LinkedIn, Indeed, Built In) are
+            # disconnected here on request to cut Apify cost while focus is on
+            # the QA tasks below — this also sidesteps the "exceed your limit
+            # of 5 concurrent Actor runs" error from running all 5 at once.
+            # To reconnect: uncomment these 3 lines, no other change needed.
+            # ("LinkedIn", "data_engineering", fetch_linkedin_jobs_via_apify_api, is_strict_data_engineer),
+            # ("Indeed", "data_engineering", fetch_indeed_jobs_via_apify_api, is_strict_data_engineer),
+            # ("BuiltIn", "data_engineering", fetch_builtin_jobs_via_apify_api, is_strict_data_engineer),
+            ("LinkedIn", "qa", _make_linkedin_qa_task_fetcher(config.LINKEDIN_QA_DUBAI_TASK_ID, "dubai"), is_qa_relevant),
+            ("LinkedIn", "qa", _make_linkedin_qa_task_fetcher(config.LINKEDIN_QA_EUROPE_TASK_ID, "europe"), is_qa_relevant),
+            # StepStone.de — a third, separate QA region (Germany-market,
+            # driven by keyword only; the actor has no location parameter).
+            # qa_region="stepstone" is stamped directly in
+            # normalize_stepstone_job, not here, since this source is always
+            # QA-only in this codebase (unlike LinkedIn, which also runs a
+            # Data Engineer pass through the same normalize function).
+            ("StepStone", "qa", fetch_stepstone_jobs_via_apify_api, is_qa_relevant),
+        ]
 
-        with ThreadPoolExecutor(max_workers=len(fetchers)) as executor:
-            future_map = {executor.submit(fetcher): source for source, fetcher in fetchers.items()}
+        with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+            future_map = {executor.submit(fetcher): (bucket, category, filter_fn) for bucket, category, fetcher, filter_fn in tasks}
             for future in as_completed(future_map):
-                source = future_map[future]
+                bucket, category, filter_fn = future_map[future]
+                label = f"{bucket} ({category})"
                 try:
                     jobs = future.result() or []
 
@@ -154,35 +245,37 @@ def run_discovery():
                         # postings — but it's also what a silently-blocked/rate-limited scrape
                         # looks like, so flag it instead of letting it look identical to "0
                         # jobs, all good" in the dashboard.
-                        message = f"{source} returned 0 jobs this scan (may be a genuine 0, or a blocked/failed fetch — check the scan log for that source's fetch attempts above)"
+                        message = f"{label} returned 0 jobs this scan (may be a genuine 0, or a blocked/failed fetch — check the scan log for that source's fetch attempts above)"
                         errors.append(message)
                         log(f"WARNING: {message}")
 
-                    # Strictly filter for Data Engineer before saving or showing
-                    filtered_jobs = [j for j in jobs if is_strict_data_engineer(j)]
+                    # Strictly filter by title before saving or showing
+                    filtered_jobs = [j for j in jobs if filter_fn(j)]
                     if len(jobs) > len(filtered_jobs):
-                        log(f"Filtered out {len(jobs) - len(filtered_jobs)} non-Data Engineer jobs from {source}.")
+                        log(f"Filtered out {len(jobs) - len(filtered_jobs)} non-matching jobs from {label}.")
 
                     jobs = filtered_jobs
-                    source_jobs[source] = jobs
+                    for j in jobs:
+                        j["job_category"] = category
+                    source_jobs[bucket] = source_jobs.get(bucket, []) + jobs
 
-                    # Live Update: Save jobs from this source immediately so they show up in UI
+                    # Live Update: Save jobs from this task immediately so they show up in UI
                     if jobs:
                         try:
-                            log(f"Live Update: Saving {len(jobs)} strictly filtered jobs from {source}...")
+                            log(f"Live Update: Saving {len(jobs)} strictly filtered jobs from {label}...")
                             save_jobs(jobs, suffix="all")
-                            
+
                             # Also save to unique so the dashboard 'Apply' tab shows them immediately
                             deduped_partial = deduplicate_jobs(jobs)
                             save_jobs(deduped_partial, suffix="unique")
                         except Exception as e:
                             log(f"Live Update Warning: {e}")
                 except Exception as exc:
-                    message = f"{source} discovery failed: {exc}"
+                    message = f"{label} discovery failed: {exc}"
                     errors.append(message)
                     error(message)
 
-        all_jobs = source_jobs["LinkedIn"] + source_jobs["Indeed"] + source_jobs["BuiltIn"]
+        all_jobs = source_jobs["LinkedIn"] + source_jobs["Indeed"] + source_jobs["BuiltIn"] + source_jobs["StepStone"]
         deduped_jobs = deduplicate_jobs(all_jobs)
         cross_platform_count = sum(1 for j in deduped_jobs if j.get("cross_platform_match"))
 
@@ -195,6 +288,7 @@ def run_discovery():
                 "LinkedIn": len(source_jobs["LinkedIn"]),
                 "Indeed": len(source_jobs["Indeed"]),
                 "BuiltIn": len(source_jobs["BuiltIn"]),
+                "StepStone": len(source_jobs["StepStone"]),
             },
             "errors": errors,
         }
@@ -205,14 +299,17 @@ def run_discovery():
         save_summary(summary)
 
         log("=== Daily discovery workflow complete ===")
+        qa_count = sum(1 for j in source_jobs["LinkedIn"] if j.get("job_category") == "qa")
         log(
-            "LinkedIn: {linkedin}, Indeed: {indeed}, BuiltIn: {builtin}".format(
+            "LinkedIn: {linkedin} (of which QA: {qa}), Indeed: {indeed}, BuiltIn: {builtin}, StepStone: {stepstone}".format(
                 linkedin=len(source_jobs["LinkedIn"]),
+                qa=qa_count,
                 indeed=len(source_jobs["Indeed"]),
                 builtin=len(source_jobs["BuiltIn"]),
+                stepstone=len(source_jobs["StepStone"]),
             )
         )
-        log(f"Total Unique Strict Data Engineer Jobs: {len(deduped_jobs)}")
+        log(f"Total Unique Jobs (Data Engineer + QA): {len(deduped_jobs)}")
         if errors:
             log(f"Discovery finished with warnings: {errors}")
 

@@ -35,6 +35,25 @@ CANDIDATE_EMAIL = os.getenv("CANDIDATE_EMAIL", "candidate@example.com")
 APIFY_TOKEN = os.getenv("APIFY_TOKEN")
 JOB_KEYWORDS = os.getenv("JOB_KEYWORDS", "Data Engineer")
 JOB_LOCATION = os.getenv("JOB_LOCATION", "United States")
+
+# QA discovery now runs against two pre-configured Apify Tasks (saved on the
+# Apify console with their own search query/location/filters baked in) rather
+# than passing searchQuery/location at call time — one task per region. Same
+# account token as APIFY_TOKEN above; only the task name/ID differs.
+LINKEDIN_QA_DUBAI_TASK_ID = os.getenv(
+    "LINKEDIN_QA_DUBAI_TASK_ID", "projects_infinytics/linkedin-jobs-scraper-task-dubai"
+)
+LINKEDIN_QA_EUROPE_TASK_ID = os.getenv(
+    "LINKEDIN_QA_EUROPE_TASK_ID", "projects_infinytics/linkedin-jobs-scraper-task-europe"
+)
+
+# StepStone.de (Germany) — a separate QA region/source, kept fully apart from
+# the LinkedIn Dubai/Europe QA passes per explicit instruction. No location
+# parameter here since the actor's own input schema doesn't support one
+# (reserved for future use on their side) — every result is Germany-market
+# by nature of the site.
+STEPSTONE_QA_KEYWORD = os.getenv("STEPSTONE_QA_KEYWORD", "Software QA Engineer")
+
 REMOTE_ONLY = True
 MAX_AGE_DAYS = 1
 OUTPUT_DIR = Path("./data")

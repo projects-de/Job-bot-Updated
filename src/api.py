@@ -1,11 +1,12 @@
 import sys
 import os
 import json
+import traceback
 from glob import glob
 from contextlib import redirect_stdout, redirect_stderr
 from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Body
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from datetime import datetime
 import shutil
 
@@ -30,10 +31,12 @@ from src.workflow.discover import run_discovery
 from src.utils.cv_processor import process_cv
 from src.workflow.optimize import generate_cover_letter, render_tailored_cv_latex
 from src.workflow.apply import signal_review_complete
+from src.utils.step_logger import log_step
 from src.storage.tracker import (
     get_tracker_summary,
     save_parsed_profile,
     save_tailored_application,
+    save_job_snapshot,
     get_dashboard_stats,
     is_tailored_today,
     JobStatus,
@@ -49,6 +52,12 @@ app = FastAPI(title="Job-Bot API")
 discovery_status = {"running": False, "last_run": None, "error": None, "last_message": None}
 application_status = {"running": False, "current_job": None, "error": None}
 DISCOVERY_LOG_FILE = os.path.join(BASE_DIR, "scratch", "discover.log")
+# Every completed run's full log gets appended here before scratch/discover.log
+# is wiped for the next scan (see _reset_discovery_log) — confirmed live that
+# without this, a past scan's actual failure (e.g. why a source returned 0
+# jobs) becomes unrecoverable the moment the next scan starts, since the live
+# log file only ever holds the current run.
+DISCOVERY_HISTORY_LOG_FILE = os.path.join(BASE_DIR, "data", "discover_history.log")
 
 
 class _TeeWriter:
@@ -83,6 +92,22 @@ def _append_discovery_log(message: str):
 
 def _reset_discovery_log():
     os.makedirs(os.path.dirname(DISCOVERY_LOG_FILE), exist_ok=True)
+    # Archive the previous run's full log before truncating it for the new
+    # run — the live file is reset every scan so the frontend's live view
+    # always shows just the current run, but that meant a past run's log was
+    # gone forever the moment the next scan started. Best-effort: a failure
+    # here should never block a new scan from starting.
+    if os.path.exists(DISCOVERY_LOG_FILE):
+        try:
+            with open(DISCOVERY_LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+                previous_run_log = f.read()
+            if previous_run_log.strip():
+                os.makedirs(os.path.dirname(DISCOVERY_HISTORY_LOG_FILE), exist_ok=True)
+                with open(DISCOVERY_HISTORY_LOG_FILE, "a", encoding="utf-8") as hf:
+                    hf.write(f"\n{'=' * 80}\n=== Archived run ended {datetime.utcnow().isoformat()} ===\n{'=' * 80}\n")
+                    hf.write(previous_run_log)
+        except Exception:
+            pass
     with open(DISCOVERY_LOG_FILE, "w", encoding="utf-8") as f:
         f.write("")
 
@@ -375,15 +400,22 @@ async def upload_cv(file: UploadFile = File(...)):
     file_path = os.path.join(UPLOADS_DIR, file.filename)
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
-    
+
+    # Logged under the fixed pseudo-job-id "cv-upload" (this step happens before
+    # any job is selected) into the same application_steps.log the apply pipeline
+    # already writes to — one place to check the whole CV-upload -> tailor ->
+    # apply chain instead of failures here being visible only as a browser alert.
+    log_step("cv-upload", "CV Upload", f"Starting: {file.filename}")
     try:
         profile = process_cv(file_path)
         if not profile:
             raise ValueError("LLM failed to extract structured data from CV")
-            
+
         save_parsed_profile(profile)
+        log_step("cv-upload", "CV Upload", f"Success: {file.filename} -> {profile.get('full_name', 'unknown')}")
         return {"message": "CV processed successfully", "profile": profile}
     except Exception as e:
+        log_step("cv-upload", "CV Upload", f"FAILED on {file.filename}: {traceback.format_exc()}", level="ERROR")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/cv/clear")
@@ -446,22 +478,52 @@ async def get_tailored_details(job_id: str):
     return tailored_payload
 
 @app.post("/jobs/tailor/{job_id}")
-def tailor_job(job_id: str):
-    latest_unique_file = get_latest_jobs_file("unique")
-    latest_all_file = get_latest_jobs_file("all")
-    if not latest_unique_file and not latest_all_file:
-        raise HTTPException(status_code=404, detail="No jobs discovered yet")
+def tailor_job(job_id: str, job_payload: Optional[Dict[str, Any]] = Body(default=None)):
+    log_step(job_id, "Tailoring", "Tailor request received")
 
-    jobs = _load_jobs_from_file(latest_unique_file) + _load_jobs_from_file(latest_all_file)
-    job = next((j for j in jobs if str(j.get('id') or j.get('job_id')) == job_id), None)
+    # A background discovery scan overwrites jobs-all/jobs-unique with a whole
+    # new result set at any time, independent of what a user is doing on the
+    # dashboard — confirmed live: a job mid auto-apply-chain vanished from both
+    # files between page load and this request because a scan ran in between,
+    # and the old file-lookup-only path failed the entire chain with "Job not
+    # found" even though the frontend was still showing the job and the user
+    # had it selected. The frontend already has the full job object in memory
+    # from whenever it originally fetched /jobs, so prefer that over a fresh
+    # disk lookup — it can't have vanished out from under a request that
+    # carries it. Falls back to the file lookup (still useful for cases where
+    # the caller doesn't supply a payload), then to this job's own tracker
+    # snapshot (populated below, and by apply.py during an actual apply run)
+    # for a job seen before, e.g. a retry after a skip.
+    job = None
+    if job_payload and str(job_payload.get('id') or job_payload.get('job_id') or '') == job_id:
+        job = job_payload
+        log_step(job_id, "Tailoring", "Resolved job from client-supplied payload (skipped disk lookup)")
+    else:
+        latest_unique_file = get_latest_jobs_file("unique")
+        latest_all_file = get_latest_jobs_file("all")
+        jobs = _load_jobs_from_file(latest_unique_file) + _load_jobs_from_file(latest_all_file)
+        job = next((j for j in jobs if str(j.get('id') or j.get('job_id')) == job_id), None)
+        if job:
+            log_step(job_id, "Tailoring", "Resolved job from latest discovery files")
+
     if not job:
+        tracker = get_tracker_summary()
+        entry = next((a for a in tracker.get("applications", []) if a.get("job_id") == job_id), None)
+        snapshot = (entry or {}).get("job_snapshot")
+        if snapshot:
+            job = {"id": job_id, "job_title": entry.get("job_title", ""), "company": entry.get("company", ""), **snapshot}
+            log_step(job_id, "Tailoring", "Resolved job from tracker snapshot (fell out of latest scan)")
+
+    if not job:
+        log_step(job_id, "Tailoring", "FAILED: job not found in client payload, latest discovery files, or tracker snapshot", level="ERROR")
         raise HTTPException(status_code=404, detail="Job not found")
-        
+
     # Get profile
     profile = get_cv_profile()
     if not profile:
+        log_step(job_id, "Tailoring", "FAILED: no CV profile on file yet", level="ERROR")
         raise HTTPException(status_code=400, detail="CV not processed yet")
-        
+
     try:
         # Truncate description to avoid token limits on the Groq call
         description = (job.get('description') or '')[:4000]
@@ -470,22 +532,41 @@ def tailor_job(job_id: str):
         # per job description, per explicit instruction to stop tailoring the CV.
         t_cv = profile
 
-        print(f"[PROCESS] Generating cover letter for job: {job_id}...")
-        t_cl = generate_cover_letter(profile, description)
+        log_step(job_id, "Tailoring", "Step 1/2: generating cover letter")
+        try:
+            t_cl = generate_cover_letter(profile, description)
+        except Exception:
+            log_step(job_id, "Tailoring", f"FAILED at cover letter generation: {traceback.format_exc()}", level="ERROR")
+            raise
 
-        print(f"[PROCESS] Rendering LaTeX version...")
-        t_latex = render_tailored_cv_latex(t_cv)
-        
+        log_step(job_id, "Tailoring", "Step 2/2: rendering LaTeX CV")
+        try:
+            t_latex = render_tailored_cv_latex(t_cv)
+        except Exception:
+            log_step(job_id, "Tailoring", f"FAILED at LaTeX rendering: {traceback.format_exc()}", level="ERROR")
+            raise
+
         payload = {"cv": t_cv, "cv_latex": t_latex, "cover_letter": t_cl}
         save_tailored_application(job_id, payload)
-        
-        # Log to tracker
+        log_step(job_id, "Tailoring", "Tailoring complete (cover letter + LaTeX CV saved)")
+
+        # Log to tracker, then immediately snapshot this job's own display
+        # fields onto that tracker entry — so if it falls out of a *later*
+        # discovery scan before /apply/start is called, that endpoint's own
+        # tracker-snapshot fallback (below) can still find it instead of
+        # failing the same way tailoring almost just did.
         from src.storage.tracker import log_application, JobStatus
         log_application(job_id, job.get('job_title', 'Unknown'), job.get('company', 'Unknown'), JobStatus.TAILORED)
-        
+        save_job_snapshot(job_id, job)
+
         print(f"[OK] Tailoring complete for: {job_id}")
         return {"message": "Job tailored successfully", "job_id": job_id, "tailored": payload}
     except Exception as e:
+        # The two inner try/excepts above already log the specific sub-step for
+        # the common failure points (cover letter / LaTeX rendering); this catches
+        # anything else in the block (e.g. save_tailored_application, tracker
+        # logging) so no failure path here can go unlogged.
+        log_step(job_id, "Tailoring", f"FAILED: {traceback.format_exc()}", level="ERROR")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/apply/status")
@@ -614,7 +695,25 @@ async def start_applications_impl(job_ids: List[str], background_tasks: Backgrou
         if jid and jid not in job_map:
             job_map[jid] = j
 
-    selected_jobs = [job_map[jid] for jid in job_ids if jid in job_map]
+    # Same fallback as /jobs/tailor: a job that already made it through tailoring
+    # (which snapshots it via save_job_snapshot) can still fall out of the
+    # latest scan files by the time the bot actually starts, since a discovery
+    # scan can run at any point independent of the apply chain. Recover it from
+    # its tracker snapshot instead of silently dropping it from this bulk run.
+    missing_ids = [jid for jid in job_ids if str(jid) not in job_map]
+    if missing_ids:
+        tracker_for_fallback = get_tracker_summary()
+        by_id = {a.get("job_id"): a for a in tracker_for_fallback.get("applications", [])}
+        for jid in missing_ids:
+            entry = by_id.get(str(jid))
+            snapshot = (entry or {}).get("job_snapshot")
+            if snapshot:
+                job_map[str(jid)] = {"id": str(jid), "job_title": entry.get("job_title", ""), "company": entry.get("company", ""), **snapshot}
+                log_step(str(jid), "Apply Start", "Resolved job from tracker snapshot (fell out of latest scan)")
+            else:
+                log_step(str(jid), "Apply Start", "FAILED: job not found in latest discovery files or tracker snapshot", level="ERROR")
+
+    selected_jobs = [job_map[str(jid)] for jid in job_ids if str(jid) in job_map]
     print(f"DEBUG: matched selected_jobs count: {len(selected_jobs)}")
 
     if not selected_jobs:

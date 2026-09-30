@@ -2095,8 +2095,8 @@ class BuiltInApplier:
         if not GROQ_API_KEY or not fields:
             return []
         try:
-            llm = ChatGroq(api_key=GROQ_API_KEY, model="llama-3.3-70b-versatile", temperature=0)
-            fallback_llm = ChatGroq(api_key=GROQ_API_KEY, model="llama-3.1-8b-instant", temperature=0)
+            llm = ChatGroq(api_key=GROQ_API_KEY, model="openai/gpt-oss-120b", temperature=0, reasoning_effort="low", max_tokens=3000)
+            fallback_llm = ChatGroq(api_key=GROQ_API_KEY, model="openai/gpt-oss-20b", temperature=0, reasoning_effort="low", max_tokens=3000)
             today_str = time.strftime("%m/%d/%Y")
             prompt = f"""You are a job application assistant filling out an external company application form
 (not LinkedIn/Indeed's own flow — this is a company careers site or ATS like Greenhouse/Workday/Lensa).

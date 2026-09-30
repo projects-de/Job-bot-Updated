@@ -87,7 +87,7 @@ def fetch_indeed_jobs_via_apify_api(options: Optional[Dict] = None) -> List[Dict
         "location": options.get("location", config.JOB_LOCATION),
         "country": options.get("country", "us"),
         "datePosted": options.get("datePosted", "1"), # Last 24 hours (Indeed internal value)
-        "limit": options.get("limit", 50),
+        "limit": options.get("limit", 10),
     }
 
     log(f"Starting Indeed Apify actor ({INDEED_ACTOR_ID}) with input:")

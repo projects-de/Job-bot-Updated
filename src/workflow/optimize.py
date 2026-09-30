@@ -60,7 +60,7 @@ def _normalize_bullets(value):
         return lines if lines else [value.strip()]
     return []
 
-def call_groq_with_retry(messages, model="llama-3.3-70b-versatile", temperature=0.1, max_retries=5, fallback_model="llama-3.1-8b-instant"):
+def call_groq_with_retry(messages, model="openai/gpt-oss-120b", temperature=0.1, max_retries=5, fallback_model="openai/gpt-oss-20b"):
     if not GROQ_API_KEY:
         raise ValueError("GROQ_API_KEY not found in environment")
 
@@ -72,6 +72,16 @@ def call_groq_with_retry(messages, model="llama-3.3-70b-versatile", temperature=
             messages=messages,
             model=m,
             temperature=temperature,
+            # Same fix as cv_processor.py: the gpt-oss models spend part of
+            # their output budget on a hidden reasoning trace before the real
+            # answer, which can truncate the actual content on a long prompt
+            # if no explicit budget is given — "low" effort favors the answer
+            # over reasoning depth (this is extraction/generation, not a task
+            # that benefits from deep reasoning), and 4000 tokens comfortably
+            # covers the longest output this call ever produces (a full
+            # tailored CV JSON or a cover letter).
+            reasoning_effort="low",
+            max_tokens=4000,
         )
         # Log successful API call
         try:

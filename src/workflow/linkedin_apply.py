@@ -688,13 +688,17 @@ def _llm_answer_fields(cv_data: dict, fields: list, modal_context: str) -> list:
     try:
         llm = ChatGroq(
             api_key=GROQ_API_KEY,
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-120b",
             temperature=0,
+            reasoning_effort="low",
+            max_tokens=3000,
         )
         fallback_llm = ChatGroq(
             api_key=GROQ_API_KEY,
-            model="llama-3.1-8b-instant",
+            model="openai/gpt-oss-20b",
             temperature=0,
+            reasoning_effort="low",
+            max_tokens=3000,
         )
         prompt = f"""You are a job application assistant. A candidate is filling a LinkedIn Easy Apply form.
 
@@ -1063,8 +1067,16 @@ def node_wait_login(state: LinkedInState) -> dict:
 # LinkedIn Easy-Apply-vs-external classifier (src/discovery/linkedin_classify.py)
 # use the exact same detection logic instead of two copies that can drift apart.
 EASY_APPLY_SELECTORS = [
-    # LinkedIn currently renders the Easy Apply control as an <a>, not a <button>,
-    # identified reliably by its aria-label (class names are hashed/obfuscated per load).
+    # LinkedIn's current "SDUI" job page (rolled out ~Aug 2026) dropped the literal
+    # "Easy Apply" text entirely — the top-card control is an <a> that just says
+    # "Apply", distinguished only by this aria-label and by linking straight to
+    # /jobs/view/<id>/apply/?openSDUIApplyFlow=true instead of an outbound redirect.
+    "a[aria-label='LinkedIn Apply to this job']",
+    "a[aria-label*='LinkedIn Apply' i]",
+    "a[href*='openSDUIApplyFlow']",
+    # Pre-SDUI LinkedIn rendered the Easy Apply control as an <a>, identified by its
+    # aria-label containing the literal "Easy Apply" text (class names are
+    # hashed/obfuscated per load) — kept as fallback in case of A/B rollback.
     "a[aria-label*='Easy Apply' i]",
     "xpath://a[contains(@aria-label, 'Easy Apply')]",
     "xpath://span[contains(text(), 'Easy Apply')]/ancestor::a",
@@ -1081,14 +1093,25 @@ EASY_APPLY_SELECTORS = [
 ]
 
 EXTERNAL_APPLY_SELECTORS = [
+    # Current SDUI layout: the outbound control's aria-label says this exact
+    # phrase, and its href is always a linkedin.com/safety/go/?url=... redirect
+    # wrapper around the employer's real ATS link rather than an in-app apply flow.
+    "a[aria-label='Apply on company website']",
+    "a[aria-label*='company website' i]",
+    "a[href*='linkedin.com/safety/go/']",
     "a.jobs-apply-button",
-    "button[aria-label*='Apply' i]:not([aria-label*='Easy' i])",
     "a[data-control-name='jobdetails_topcard_inapply']",
     ".jobs-unified-top-card__content a.artdeco-button--primary",
-    "a[aria-label*='Apply' i]:not([aria-label*='Easy' i])",
     "xpath://div[contains(@class, 'jobs-unified-top-card')]//a[contains(., 'Apply')]",
     "xpath://div[contains(@class, 'jobs-unified-top-card')]//span[contains(text(), 'Apply')]/ancestor::a",
-    "xpath://div[contains(@class, 'jobs-unified-top-card')]//span[contains(text(), 'Apply')]/ancestor::button"
+    "xpath://div[contains(@class, 'jobs-unified-top-card')]//span[contains(text(), 'Apply')]/ancestor::button",
+    # Broad generic fallbacks — kept last since, on the current SDUI layout, both
+    # Easy Apply and external buttons say plain "Apply" with no "Easy" in their
+    # aria-label, so these alone can't tell the two apart (that's what broke
+    # classification: this list used to be checked and always won). Only reached
+    # if every EASY_APPLY_SELECTORS entry above already failed to match.
+    "button[aria-label*='Apply' i]:not([aria-label*='Easy' i])",
+    "a[aria-label*='Apply' i]:not([aria-label*='Easy' i])"
 ]
 
 
@@ -3585,8 +3608,8 @@ class LinkedInExternalApplier:
         if not GROQ_API_KEY or not fields:
             return []
         try:
-            llm = ChatGroq(api_key=GROQ_API_KEY, model="llama-3.3-70b-versatile", temperature=0)
-            fallback_llm = ChatGroq(api_key=GROQ_API_KEY, model="llama-3.1-8b-instant", temperature=0)
+            llm = ChatGroq(api_key=GROQ_API_KEY, model="openai/gpt-oss-120b", temperature=0, reasoning_effort="low", max_tokens=3000)
+            fallback_llm = ChatGroq(api_key=GROQ_API_KEY, model="openai/gpt-oss-20b", temperature=0, reasoning_effort="low", max_tokens=3000)
             today_str = time.strftime("%m/%d/%Y")
             prompt = f"""You are a job application assistant filling out an external company application form
 reached via a LinkedIn "Apply" redirect (not LinkedIn's own Easy Apply flow).
